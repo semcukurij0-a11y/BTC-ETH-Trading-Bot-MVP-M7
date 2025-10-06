@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Health Fix Test</title>
+    <style>
+        body { font-family: Arial, sans-serif; margin: 20px; }
+        .test-section { margin: 20px 0; padding: 15px; border: 1px solid #ddd; border-radius: 5px; }
+        .success { background-color: #d4edda; border-color: #c3e6cb; }
+        .error { background-color: #f8d7da; border-color: #f5c6cb; }
+        .warning { background-color: #fff3cd; border-color: #ffeaa7; }
+        pre { background-color: #f8f9fa; padding: 10px; border-radius: 3px; overflow-x: auto; }
+    </style>
+</head>
+<body>
+    <h1>Health Fix Test</h1>
+    <p>Testing the health endpoint fix for the frontend.</p>
+    
+    <div class="test-section">
+        <h2>Test 1: Basic Health Endpoint</h2>
+        <button onclick="testBasicHealth()">Test Basic Health</button>
+        <div id="basic-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Test 2: Detailed Health Endpoint</h2>
+        <button onclick="testDetailedHealth()">Test Detailed Health</button>
+        <div id="detailed-result"></div>
+    </div>
+    
+    <div class="test-section">
+        <h2>Test 3: Frontend Fallback Behavior</h2>
+        <button onclick="testFallbackBehavior()">Test Fallback</button>
+        <div id="fallback-result"></div>
+    </div>
+
+    <script>
+        const baseUrl = 'http://localhost:8000';
+        
+        async function testBasicHealth() {
+            const resultDiv = document.getElementById('basic-result');
+            resultDiv.innerHTML = '<p>Testing...</p>';
+            
+            try {
+                const response = await fetch(`${baseUrl}/health`);
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultDiv.innerHTML = `
+                        <div class="test-section success">
+                            <h3>✅ Basic Health Test Passed</h3>
+                            <p><strong>Status:</strong> ${data.status}</p>
+                            <p><strong>Uptime:</strong> ${data.uptime_seconds?.toFixed(2)} seconds</p>
+                            <p><strong>System:</strong> ${JSON.stringify(data.system, null, 2)}</p>
+                        </div>
+                    `;
+                } else {
+                    resultDiv.innerHTML = `
+                        <div class="test-section error">
+                            <h3>❌ Basic Health Test Failed</h3>
+                            <p><strong>Status Code:</strong> ${response.status}</p>
+                            <p><strong>Response:</strong> ${JSON.stringify(data, null, 2)}</p>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="test-section error">
+                        <h3>❌ Basic Health Test Error</h3>
+                        <p><strong>Error:</strong> ${error.message}</p>
+                        <p>This indicates the server is not running or not accessible.</p>
+                    </div>
+                `;
+            }
+        }
+        
+        async function testDetailedHealth() {
+            const resultDiv = document.getElementById('detailed-result');
+            resultDiv.innerHTML = '<p>Testing...</p>';
+            
+            try {
+                const response = await fetch(`${baseUrl}/health/detailed`);
+                const data = await response.json();
+                
+                if (response.ok) {
+                    resultDiv.innerHTML = `
+                        <div class="test-section success">
+                            <h3>✅ Detailed Health Test Passed</h3>
+                            <p><strong>Status:</strong> ${data.status}</p>
+                            <p><strong>Uptime:</strong> ${data.uptime_seconds?.toFixed(2)} seconds</p>
+                            <p><strong>System:</strong> ${JSON.stringify(data.system, null, 2)}</p>
+                            <p><strong>Data:</strong> ${JSON.stringify(data.data, null, 2)}</p>
+                            <p><strong>Environment:</strong> ${JSON.stringify(data.environment, null, 2)}</p>
+                        </div>
+                    `;
+                } else {
+                    resultDiv.innerHTML = `
+                        <div class="test-section error">
+                            <h3>❌ Detailed Health Test Failed</h3>
+                            <p><strong>Status Code:</strong> ${response.status}</p>
+                            <p><strong>Response:</strong> ${JSON.stringify(data, null, 2)}</p>
+                        </div>
+                    `;
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="test-section error">
+                        <h3>❌ Detailed Health Test Error</h3>
+                        <p><strong>Error:</strong> ${error.message}</p>
+                        <p>This indicates the server is not running or the endpoint is not available.</p>
+                    </div>
+                `;
+            }
+        }
+        
+        async function testFallbackBehavior() {
+            const resultDiv = document.getElementById('fallback-result');
+            resultDiv.innerHTML = '<p>Testing fallback behavior...</p>';
+            
+            try {
+                // Try detailed first
+                let detailedResponse;
+                try {
+                    detailedResponse = await fetch(`${baseUrl}/health/detailed`);
+                } catch (error) {
+                    detailedResponse = null;
+                }
+                
+                if (detailedResponse && detailedResponse.ok) {
+                    const detailedData = await detailedResponse.json();
+                    resultDiv.innerHTML = `
+                        <div class="test-section success">
+                            <h3>✅ Detailed Endpoint Available</h3>
+                            <p>No fallback needed - detailed endpoint is working.</p>
+                            <pre>${JSON.stringify(detailedData, null, 2)}</pre>
+                        </div>
+                    `;
+                } else {
+                    // Fallback to basic
+                    console.warn('Detailed health endpoint not available, falling back to basic health');
+                    const basicResponse = await fetch(`${baseUrl}/health`);
+                    
+                    if (basicResponse.ok) {
+                        const basicData = await basicResponse.json();
+                        
+                        // Simulate frontend conversion
+                        const fallbackData = {
+                            status: basicData.status || 'unknown',
+                            timestamp: basicData.timestamp || new Date().toISOString(),
+                            uptime_seconds: basicData.uptime_seconds || 0,
+                            last_heartbeat: basicData.last_heartbeat || new Date().toISOString(),
+                            system: basicData.system || {},
+                            data: {},
+                            environment: {},
+                            bybit_connection: basicData.bybit_connection || {}
+                        };
+                        
+                        resultDiv.innerHTML = `
+                            <div class="test-section warning">
+                                <h3>⚠️ Fallback Used</h3>
+                                <p>Detailed endpoint not available, using basic health with fallback conversion.</p>
+                                <pre>${JSON.stringify(fallbackData, null, 2)}</pre>
+                            </div>
+                        `;
+                    } else {
+                        resultDiv.innerHTML = `
+                            <div class="test-section error">
+                                <h3>❌ Both Endpoints Failed</h3>
+                                <p>Neither detailed nor basic health endpoints are working.</p>
+                            </div>
+                        `;
+                    }
+                }
+            } catch (error) {
+                resultDiv.innerHTML = `
+                    <div class="test-section error">
+                        <h3>❌ Fallback Test Error</h3>
+                        <p><strong>Error:</strong> ${error.message}</p>
+                    </div>
+                `;
+            }
+        }
+    </script>
+</body>
+</html>

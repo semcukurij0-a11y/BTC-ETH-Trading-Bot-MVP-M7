@@ -1,0 +1,217 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Test Positions Frontend</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #1a1a1a;
+            color: white;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .test-section {
+            background-color: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .btn {
+            background-color: #0066cc;
+            color: white;
+            border: none;
+            padding: 10px 20px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+        }
+        .btn:hover {
+            background-color: #0052a3;
+        }
+        .result {
+            background-color: #1a1a1a;
+            padding: 15px;
+            border-radius: 5px;
+            margin-top: 10px;
+            white-space: pre-wrap;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Test Positions Frontend</h1>
+        
+        <div class="test-section">
+            <h3>Test Backend Connection</h3>
+            <button class="btn" onclick="testBackend()">Test Backend</button>
+            <button class="btn" onclick="testPositions()">Test Positions</button>
+            <button class="btn" onclick="testFrontend()">Test Frontend</button>
+            <div id="result" class="result"></div>
+        </div>
+    </div>
+
+    <script>
+        const baseUrl = 'http://localhost:8000';
+        let authToken = null;
+
+        async function testBackend() {
+            const result = document.getElementById('result');
+            result.textContent = 'Testing backend connection...\n';
+            
+            try {
+                // Test authentication
+                const loginResponse = await fetch(`${baseUrl}/auth/login`, {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        username: 'admin',
+                        password: 'admin123'
+                    })
+                });
+                
+                if (loginResponse.ok) {
+                    const loginData = await loginResponse.json();
+                    authToken = loginData.token;
+                    result.textContent += `✅ Authentication successful\n`;
+                    result.textContent += `Token: ${authToken.substring(0, 20)}...\n`;
+                } else {
+                    result.textContent += `❌ Authentication failed: ${loginResponse.status}\n`;
+                    return;
+                }
+                
+                // Test positions endpoint
+                const positionsResponse = await fetch(`${baseUrl}/trading/positions`, {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`,
+                        'Content-Type': 'application/json',
+                    }
+                });
+                
+                if (positionsResponse.ok) {
+                    const positionsData = await positionsResponse.json();
+                    result.textContent += `✅ Positions endpoint successful\n`;
+                    result.textContent += `Success: ${positionsData.success}\n`;
+                    result.textContent += `Count: ${positionsData.count}\n`;
+                    result.textContent += `Positions: ${JSON.stringify(positionsData.positions, null, 2)}\n`;
+                } else {
+                    result.textContent += `❌ Positions endpoint failed: ${positionsResponse.status}\n`;
+                }
+                
+            } catch (error) {
+                result.textContent += `❌ Error: ${error.message}\n`;
+            }
+        }
+
+        async function testPositions() {
+            const result = document.getElementById('result');
+            result.textContent = 'Testing positions data...\n';
+            
+            if (!authToken) {
+                result.textContent += '❌ No auth token. Please test backend first.\n';
+                return;
+            }
+            
+            try {
+                const response = await fetch(`${baseUrl}/trading/positions`, {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`,
+                        'Content-Type': 'application/json',
+                    }
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    result.textContent += `✅ Positions data received\n`;
+                    result.textContent += `Data structure: ${JSON.stringify(data, null, 2)}\n`;
+                    
+                    if (data.positions && data.positions.length > 0) {
+                        result.textContent += `\n📊 Position Details:\n`;
+                        data.positions.forEach((pos, i) => {
+                            result.textContent += `Position ${i + 1}:\n`;
+                            result.textContent += `  Symbol: ${pos.symbol}\n`;
+                            result.textContent += `  Side: ${pos.side}\n`;
+                            result.textContent += `  Size: ${pos.size}\n`;
+                            result.textContent += `  Entry Price: ${pos.entry_price}\n`;
+                            result.textContent += `  Current Price: ${pos.current_price}\n`;
+                            result.textContent += `  Unrealized PnL: ${pos.unrealized_pnl}\n`;
+                            result.textContent += `  Leverage: ${pos.leverage}\n`;
+                            result.textContent += `\n`;
+                        });
+                    } else {
+                        result.textContent += `⚠️ No positions found\n`;
+                    }
+                } else {
+                    result.textContent += `❌ Failed to fetch positions: ${response.status}\n`;
+                }
+                
+            } catch (error) {
+                result.textContent += `❌ Error: ${error.message}\n`;
+            }
+        }
+
+        async function testFrontend() {
+            const result = document.getElementById('result');
+            result.textContent = 'Testing frontend simulation...\n';
+            
+            if (!authToken) {
+                result.textContent += '❌ No auth token. Please test backend first.\n';
+                return;
+            }
+            
+            try {
+                // Simulate what the frontend TradingBotService does
+                const response = await fetch(`${baseUrl}/trading/positions`, {
+                    headers: {
+                        'Authorization': `Bearer ${authToken}`,
+                        'Content-Type': 'application/json',
+                    }
+                });
+                
+                if (response.ok) {
+                    const data = await response.json();
+                    result.textContent += `✅ Frontend simulation successful\n`;
+                    result.textContent += `Data type: ${typeof data}\n`;
+                    result.textContent += `Has positions key: ${'positions' in data}\n`;
+                    
+                    if (data.positions) {
+                        result.textContent += `Positions length: ${data.positions.length}\n`;
+                        
+                        // Simulate the frontend component receiving this data
+                        const positions = data.positions;
+                        result.textContent += `\n📊 Frontend Component Data:\n`;
+                        result.textContent += `Positions array length: ${positions.length}\n`;
+                        
+                        if (positions.length > 0) {
+                            const firstPos = positions[0];
+                            result.textContent += `First position:\n`;
+                            result.textContent += `  Symbol: ${firstPos.symbol}\n`;
+                            result.textContent += `  Size: ${firstPos.size}\n`;
+                            result.textContent += `  Entry Price: ${firstPos.entry_price}\n`;
+                            result.textContent += `  Current Price: ${firstPos.current_price}\n`;
+                            result.textContent += `  Unrealized PnL: ${firstPos.unrealized_pnl}\n`;
+                            result.textContent += `  Leverage: ${firstPos.leverage}\n`;
+                        }
+                    } else {
+                        result.textContent += `❌ No positions key in response\n`;
+                        result.textContent += `Available keys: ${Object.keys(data)}\n`;
+                    }
+                } else {
+                    result.textContent += `❌ Frontend simulation failed: ${response.status}\n`;
+                }
+                
+            } catch (error) {
+                result.textContent += `❌ Error: ${error.message}\n`;
+            }
+        }
+    </script>
+</body>
+</html>

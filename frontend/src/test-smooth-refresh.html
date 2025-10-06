@@ -1,0 +1,293 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Smooth Refresh Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #1a1a1a;
+            color: white;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            background-color: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .status-bar {
+            background-color: #2d2d2d;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            border-left: 4px solid #0066cc;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(250px, 1fr));
+            gap: 20px;
+            margin-bottom: 20px;
+        }
+        .stat-card {
+            background-color: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            transition: all 0.3s ease;
+            border: 1px solid #3d3d3d;
+        }
+        .stat-card:hover {
+            background-color: #3d3d3d;
+            transform: translateY(-2px);
+        }
+        .stat-card.updating {
+            border-color: #0066cc;
+            box-shadow: 0 0 10px rgba(0, 102, 204, 0.3);
+        }
+        .stat-value {
+            font-size: 2rem;
+            font-weight: bold;
+            margin: 10px 0;
+            transition: color 0.5s ease;
+        }
+        .stat-value.positive {
+            color: #00ff88;
+        }
+        .stat-value.negative {
+            color: #ff4444;
+        }
+        .stat-label {
+            color: #888;
+            font-size: 0.9rem;
+            margin-bottom: 5px;
+        }
+        .refresh-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background-color: #00ff00;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+        .refresh-indicator.updating {
+            background-color: #0066ff;
+            animation: spin 1s linear infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        @keyframes spin {
+            0% { transform: rotate(0deg); }
+            100% { transform: rotate(360deg); }
+        }
+        .controls {
+            background-color: #2d2d2d;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .btn {
+            background-color: #0066cc;
+            color: white;
+            border: none;
+            padding: 8px 16px;
+            border-radius: 4px;
+            cursor: pointer;
+            margin-right: 10px;
+            transition: background-color 0.3s;
+        }
+        .btn:hover {
+            background-color: #0052a3;
+        }
+        .btn:disabled {
+            background-color: #555;
+            cursor: not-allowed;
+        }
+        .smooth-transition {
+            transition: all 0.5s ease;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Smooth Refresh System Test</h1>
+            <p>This demonstrates how the new smooth refresh system updates only dynamic values without causing full page reloads.</p>
+        </div>
+
+        <div class="status-bar">
+            <div class="refresh-indicator" id="refresh-indicator"></div>
+            <strong>Status:</strong> <span id="status">Ready</span> | 
+            <strong>Last Update:</strong> <span id="last-update">Never</span> | 
+            <strong>Refresh Interval:</strong> <span id="refresh-interval">10000ms</span>
+        </div>
+
+        <div class="controls">
+            <button class="btn" onclick="startSmoothRefresh()">Start Smooth Refresh</button>
+            <button class="btn" onclick="stopSmoothRefresh()">Stop Refresh</button>
+            <button class="btn" onclick="manualRefresh()">Manual Refresh</button>
+            <button class="btn" onclick="toggleFastMode()">Toggle Fast Mode</button>
+        </div>
+
+        <div class="stats-grid">
+            <div class="stat-card" id="total-pnl-card">
+                <div class="stat-label">Total P&L</div>
+                <div class="stat-value" id="total-pnl">$0.00</div>
+                <div class="stat-label">Combined unrealized + realized</div>
+            </div>
+
+            <div class="stat-card" id="unrealized-pnl-card">
+                <div class="stat-label">Unrealized P&L</div>
+                <div class="stat-value" id="unrealized-pnl">$0.00</div>
+                <div class="stat-label">Open positions</div>
+            </div>
+
+            <div class="stat-card" id="realized-pnl-card">
+                <div class="stat-label">Realized P&L</div>
+                <div class="stat-value" id="realized-pnl">$0.00</div>
+                <div class="stat-label">Closed positions</div>
+            </div>
+
+            <div class="stat-card" id="daily-pnl-card">
+                <div class="stat-label">Daily P&L</div>
+                <div class="stat-value" id="daily-pnl">$0.00</div>
+                <div class="stat-label">Today's performance</div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let refreshInterval = null;
+        let isRefreshing = false;
+        let fastMode = false;
+        let currentInterval = 10000; // 10 seconds
+
+        // Simulate smooth data updates
+        function updateStats() {
+            if (isRefreshing) return;
+
+            isRefreshing = true;
+            document.getElementById('status').textContent = 'Smooth updating...';
+            document.getElementById('refresh-indicator').classList.add('updating');
+
+            // Add updating class to cards
+            document.querySelectorAll('.stat-card').forEach(card => {
+                card.classList.add('updating');
+            });
+
+            // Simulate API call delay
+            setTimeout(() => {
+                // Generate random PnL values
+                const totalPnL = (Math.random() - 0.5) * 2000;
+                const unrealizedPnL = (Math.random() - 0.5) * 1000;
+                const realizedPnL = totalPnL - unrealizedPnL;
+                const dailyPnL = (Math.random() - 0.5) * 500;
+
+                // Update values with smooth transitions
+                updateStatValue('total-pnl', totalPnL, 'total-pnl-card');
+                updateStatValue('unrealized-pnl', unrealizedPnL, 'unrealized-pnl-card');
+                updateStatValue('realized-pnl', realizedPnL, 'realized-pnl-card');
+                updateStatValue('daily-pnl', dailyPnL, 'daily-pnl-card');
+
+                // Update status
+                document.getElementById('status').textContent = 'Live';
+                document.getElementById('last-update').textContent = new Date().toLocaleTimeString();
+                document.getElementById('refresh-indicator').classList.remove('updating');
+
+                // Remove updating class from cards
+                document.querySelectorAll('.stat-card').forEach(card => {
+                    card.classList.remove('updating');
+                });
+
+                isRefreshing = false;
+                console.log('✅ Smooth refresh completed - no page reload!');
+            }, 500);
+        }
+
+        function updateStatValue(elementId, value, cardId) {
+            const element = document.getElementById(elementId);
+            const card = document.getElementById(cardId);
+            
+            // Format currency
+            const formattedValue = `$${value.toFixed(2)}`;
+            
+            // Update value with smooth transition
+            element.textContent = formattedValue;
+            
+            // Update color based on value
+            element.className = 'stat-value smooth-transition';
+            if (value >= 0) {
+                element.classList.add('positive');
+            } else {
+                element.classList.add('negative');
+            }
+        }
+
+        function startSmoothRefresh() {
+            if (refreshInterval) return;
+
+            console.log('🔄 Starting smooth refresh system...');
+            document.getElementById('status').textContent = 'Starting...';
+            
+            // Initial update
+            updateStats();
+            
+            // Set up interval
+            refreshInterval = setInterval(updateStats, currentInterval);
+            
+            document.getElementById('refresh-interval').textContent = currentInterval + 'ms';
+        }
+
+        function stopSmoothRefresh() {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+                refreshInterval = null;
+                document.getElementById('status').textContent = 'Stopped';
+                document.getElementById('refresh-indicator').classList.remove('updating');
+                console.log('⏹️ Smooth refresh stopped');
+            }
+        }
+
+        function manualRefresh() {
+            if (isRefreshing) return;
+            
+            console.log('🔄 Manual smooth refresh triggered');
+            updateStats();
+        }
+
+        function toggleFastMode() {
+            fastMode = !fastMode;
+            currentInterval = fastMode ? 2000 : 10000; // 2s vs 10s
+            
+            if (refreshInterval) {
+                stopSmoothRefresh();
+                startSmoothRefresh();
+            }
+            
+            document.getElementById('refresh-interval').textContent = currentInterval + 'ms';
+            console.log(`🔄 ${fastMode ? 'Fast' : 'Normal'} mode: ${currentInterval}ms interval`);
+        }
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+        });
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            console.log('✅ Smooth refresh test page loaded');
+        });
+    </script>
+</body>
+</html>

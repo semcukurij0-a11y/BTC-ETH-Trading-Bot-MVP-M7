@@ -1,0 +1,260 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Tab-Specific Refresh Test</title>
+    <style>
+        body {
+            font-family: Arial, sans-serif;
+            background-color: #1a1a1a;
+            color: white;
+            margin: 0;
+            padding: 20px;
+        }
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+        }
+        .header {
+            background-color: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+        }
+        .tabs {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 20px;
+        }
+        .tab {
+            padding: 10px 20px;
+            background-color: #3d3d3d;
+            border: none;
+            color: white;
+            border-radius: 5px;
+            cursor: pointer;
+            transition: background-color 0.3s;
+        }
+        .tab.active {
+            background-color: #0066cc;
+        }
+        .tab:hover {
+            background-color: #4d4d4d;
+        }
+        .content {
+            background-color: #2d2d2d;
+            padding: 20px;
+            border-radius: 8px;
+            min-height: 400px;
+        }
+        .status {
+            background-color: #1a1a1a;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 20px;
+            border-left: 4px solid #0066cc;
+        }
+        .data-display {
+            background-color: #1a1a1a;
+            padding: 15px;
+            border-radius: 5px;
+            margin-bottom: 10px;
+        }
+        .refresh-indicator {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background-color: #00ff00;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+        }
+        @keyframes pulse {
+            0% { opacity: 1; }
+            50% { opacity: 0.5; }
+            100% { opacity: 1; }
+        }
+        .error {
+            background-color: #4a1a1a;
+            border-left-color: #ff0000;
+        }
+        .loading {
+            background-color: #1a2a4a;
+            border-left-color: #0066ff;
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>Tab-Specific Refresh System Test</h1>
+            <p>This demonstrates how the new refresh system only updates data for the active tab, without reloading the entire page.</p>
+        </div>
+
+        <div class="tabs">
+            <button class="tab active" data-tab="dashboard">Dashboard (10s)</button>
+            <button class="tab" data-tab="positions">Positions (5s)</button>
+            <button class="tab" data-tab="orders">Orders (10s)</button>
+            <button class="tab" data-tab="signals">Signals (15s)</button>
+            <button class="tab" data-tab="health">Health (5s)</button>
+        </div>
+
+        <div class="content">
+            <div class="status" id="status">
+                <div class="refresh-indicator"></div>
+                <strong>Active Tab:</strong> <span id="active-tab">dashboard</span> | 
+                <strong>Refresh Interval:</strong> <span id="refresh-interval">10000ms</span> | 
+                <strong>Last Update:</strong> <span id="last-update">Never</span>
+            </div>
+
+            <div id="tab-content">
+                <div class="data-display">
+                    <h3>Dashboard Data</h3>
+                    <p><strong>Total P&L:</strong> <span id="total-pnl">$0.00</span></p>
+                    <p><strong>Unrealized P&L:</strong> <span id="unrealized-pnl">$0.00</span></p>
+                    <p><strong>Realized P&L:</strong> <span id="realized-pnl">$0.00</span></p>
+                    <p><strong>Active Positions:</strong> <span id="active-positions">0</span></p>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        // Tab configuration
+        const TAB_CONFIG = {
+            dashboard: { interval: 10000, name: 'Dashboard' },
+            positions: { interval: 5000, name: 'Positions' },
+            orders: { interval: 10000, name: 'Orders' },
+            signals: { interval: 15000, name: 'Signals' },
+            health: { interval: 5000, name: 'Health' }
+        };
+
+        let activeTab = 'dashboard';
+        let refreshInterval = null;
+        let lastUpdate = null;
+
+        // Simulate data fetching for different tabs
+        function fetchTabData(tab) {
+            const now = new Date();
+            lastUpdate = now.toLocaleTimeString();
+            
+            // Update status
+            document.getElementById('active-tab').textContent = tab;
+            document.getElementById('refresh-interval').textContent = TAB_CONFIG[tab].interval + 'ms';
+            document.getElementById('last-update').textContent = lastUpdate;
+
+            // Simulate different data for different tabs
+            switch (tab) {
+                case 'dashboard':
+                    document.getElementById('tab-content').innerHTML = `
+                        <div class="data-display">
+                            <h3>Dashboard Data</h3>
+                            <p><strong>Total P&L:</strong> <span id="total-pnl">$${(Math.random() * 1000 - 500).toFixed(2)}</span></p>
+                            <p><strong>Unrealized P&L:</strong> <span id="unrealized-pnl">$${(Math.random() * 500 - 250).toFixed(2)}</span></p>
+                            <p><strong>Realized P&L:</strong> <span id="realized-pnl">$${(Math.random() * 500 - 250).toFixed(2)}</span></p>
+                            <p><strong>Active Positions:</strong> <span id="active-positions">${Math.floor(Math.random() * 10)}</span></p>
+                        </div>
+                    `;
+                    break;
+                case 'positions':
+                    document.getElementById('tab-content').innerHTML = `
+                        <div class="data-display">
+                            <h3>Positions Data</h3>
+                            <p><strong>Open Positions:</strong> <span id="open-positions">${Math.floor(Math.random() * 5)}</span></p>
+                            <p><strong>Total Margin:</strong> <span id="total-margin">$${(Math.random() * 10000).toFixed(2)}</span></p>
+                            <p><strong>Average Leverage:</strong> <span id="avg-leverage">${(Math.random() * 10 + 1).toFixed(1)}x</span></p>
+                        </div>
+                    `;
+                    break;
+                case 'orders':
+                    document.getElementById('tab-content').innerHTML = `
+                        <div class="data-display">
+                            <h3>Orders Data</h3>
+                            <p><strong>Total Orders:</strong> <span id="total-orders">${Math.floor(Math.random() * 100)}</span></p>
+                            <p><strong>Filled Orders:</strong> <span id="filled-orders">${Math.floor(Math.random() * 50)}</span></p>
+                            <p><strong>Pending Orders:</strong> <span id="pending-orders">${Math.floor(Math.random() * 10)}</span></p>
+                        </div>
+                    `;
+                    break;
+                case 'signals':
+                    document.getElementById('tab-content').innerHTML = `
+                        <div class="data-display">
+                            <h3>Signals Data</h3>
+                            <p><strong>Active Signals:</strong> <span id="active-signals">${Math.floor(Math.random() * 5)}</span></p>
+                            <p><strong>Signal Strength:</strong> <span id="signal-strength">${(Math.random() * 100).toFixed(1)}%</span></p>
+                            <p><strong>Last Signal:</strong> <span id="last-signal">${Math.floor(Math.random() * 60)} minutes ago</span></p>
+                        </div>
+                    `;
+                    break;
+                case 'health':
+                    document.getElementById('tab-content').innerHTML = `
+                        <div class="data-display">
+                            <h3>Health Data</h3>
+                            <p><strong>System Status:</strong> <span id="system-status">Healthy</span></p>
+                            <p><strong>API Latency:</strong> <span id="api-latency">${Math.floor(Math.random() * 100)}ms</span></p>
+                            <p><strong>Memory Usage:</strong> <span id="memory-usage">${(Math.random() * 100).toFixed(1)}%</span></p>
+                        </div>
+                    `;
+                    break;
+            }
+
+            console.log(`✅ Tab-specific data refreshed for: ${tab} at ${lastUpdate}`);
+        }
+
+        // Start refresh interval for a tab
+        function startTabRefresh(tab) {
+            // Clear existing interval
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+
+            // Start new interval
+            const interval = TAB_CONFIG[tab].interval;
+            refreshInterval = setInterval(() => {
+                fetchTabData(tab);
+            }, interval);
+
+            // Initial fetch
+            fetchTabData(tab);
+
+            console.log(`🔄 Started tab-specific refresh for: ${tab} (${interval}ms interval)`);
+        }
+
+        // Handle tab switching
+        function switchTab(tab) {
+            activeTab = tab;
+            
+            // Update tab buttons
+            document.querySelectorAll('.tab').forEach(btn => {
+                btn.classList.remove('active');
+            });
+            document.querySelector(`[data-tab="${tab}"]`).classList.add('active');
+
+            // Start refresh for new tab
+            startTabRefresh(tab);
+        }
+
+        // Initialize
+        document.addEventListener('DOMContentLoaded', () => {
+            // Add click handlers to tabs
+            document.querySelectorAll('.tab').forEach(btn => {
+                btn.addEventListener('click', () => {
+                    const tab = btn.getAttribute('data-tab');
+                    switchTab(tab);
+                });
+            });
+
+            // Start with dashboard
+            startTabRefresh('dashboard');
+        });
+
+        // Cleanup on page unload
+        window.addEventListener('beforeunload', () => {
+            if (refreshInterval) {
+                clearInterval(refreshInterval);
+            }
+        });
+    </script>
+</body>
+</html>
