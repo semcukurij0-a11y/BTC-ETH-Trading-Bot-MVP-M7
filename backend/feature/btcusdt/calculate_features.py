@@ -16,9 +16,15 @@ from pathlib import Path
 import warnings
 warnings.filterwarnings('ignore')
 
-# Configuration
-DATA_FILE = "../../data/btcusdt/1h_btc.parquet"
-OUTPUT_FILE = "btcusdt_features.parquet"
+# Configuration - Use relative paths
+# Try multiple possible paths to make the script work from different directories
+POSSIBLE_DATA_PATHS = [
+    "../../data/btcusdt/1h_btc.parquet",  # From feature/btcusdt directory
+    "data/btcusdt/1h_btc.parquet",        # From backend directory
+]
+# Get the directory where this script is located for output
+SCRIPT_DIR = Path(__file__).parent
+OUTPUT_FILE = SCRIPT_DIR / "btcusdt_features.parquet"
 
 def calculate_log_returns(prices):
     """Calculate log returns"""
@@ -58,10 +64,30 @@ def calculate_volume_zscore(volume, period=20):
 def main():
     print("=== BTCUSDT Feature Calculator ===")
     
-    # Load data
-    data_path = Path(DATA_FILE)
-    if not data_path.exists():
-        print(f"Error: Data file not found at {data_path}")
+    # Debug: Show file paths and current working directory
+    current_dir = Path.cwd()
+    print(f"Current working directory: {current_dir}")
+    
+    # Try to find the data file using multiple possible paths
+    data_path = None
+    for path_str in POSSIBLE_DATA_PATHS:
+        test_path = Path(path_str)
+        print(f"Trying path: {path_str} -> {test_path.resolve()}")
+        if test_path.exists():
+            data_path = test_path
+            print(f"[OK] Found data file at: {path_str}")
+            break
+        else:
+            print(f"[NOT FOUND] {path_str}")
+    
+    if data_path is None:
+        print("Error: Data file not found in any expected location")
+        print("Tried the following paths:")
+        for path_str in POSSIBLE_DATA_PATHS:
+            print(f"  - {path_str}")
+        print("\nCurrent directory structure:")
+        for item in current_dir.iterdir():
+            print(f"  - {item.name}")
         return
     
     print(f"Loading data from {data_path}")
@@ -131,7 +157,7 @@ def main():
     output_path = Path(OUTPUT_FILE)
     features_df.to_parquet(output_path, index=False)
     
-    print(f"Features saved to {output_path}")
+    print(f"Features saved to {output_path.absolute()}")
     
     # Display sample of features
     print("\nSample of calculated features:")

@@ -1,473 +1,621 @@
+#!/usr/bin/env python3
 """
 Technical Analysis Module for Crypto Trading Bot
 
-This module implements technical analysis rules and generates s_ta signals in [-1, +1] range.
-Features:
-- SMA(20) vs SMA(100) trend analysis
-- ATR(14)/Price volatility filtering with percentile thresholds
-- Optional Elliott Wave analysis (feature-flag)
-- Output: s_ta in [-1, +1] range
+This module provides technical analysis functionality including:
+- Moving averages (SMA, EMA)
+- Oscillators (RSI, MACD, Stochastic)
+- Volatility indicators (ATR, Bollinger Bands)
+- Trend indicators (ADX, Parabolic SAR)
+- Volume indicators (Volume Z-Score, OBV)
+- Support/Resistance levels
+- Elliott Wave analysis (optional)
 """
 
-import pandas as pd
 import numpy as np
+import pandas as pd
 import logging
-from typing import Dict, List, Optional, Tuple, Any
+from typing import Dict, List, Optional, Any, Tuple
 from datetime import datetime, timedelta
 import warnings
 warnings.filterwarnings('ignore')
 
+logger = logging.getLogger(__name__)
+
 
 class TechnicalAnalysisModule:
     """
-    Technical Analysis Module for crypto trading signals.
+    Technical Analysis Module for generating trading signals.
     
-    Implements:
-    - SMA trend analysis (SMA20 vs SMA100)
-    - ATR volatility filtering with percentile thresholds
-    - Optional Elliott Wave analysis
-    - s_ta signal generation in [-1, +1] range
+    Provides comprehensive technical analysis including:
+    - Trend analysis
+    - Momentum indicators
+    - Volatility analysis
+    - Volume analysis
+    - Support/resistance levels
     """
     
-    def __init__(self, 
-                 config: Optional[Dict] = None,
-                 enable_elliott_wave: bool = False):
+    def __init__(self, config: Optional[Dict] = None):
         """
         Initialize Technical Analysis Module.
         
         Args:
-            config: Configuration dictionary
-            enable_elliott_wave: Enable Elliott Wave analysis (feature flag)
+            config: Configuration dictionary with technical analysis parameters
         """
         self.config = config or {}
-        self.enable_elliott_wave = enable_elliott_wave
-        
-        # Setup logging
-        self.logger = logging.getLogger(__name__)
         
         # Technical analysis parameters
         self.sma_short = self.config.get('sma_short', 20)
         self.sma_long = self.config.get('sma_long', 100)
         self.atr_period = self.config.get('atr_period', 14)
-        self.volatility_window = self.config.get('volatility_window', 90)  # days
+        self.volatility_window = self.config.get('volatility_window', 90)
         self.volatility_percentile_low = self.config.get('volatility_percentile_low', 25)
         self.volatility_percentile_high = self.config.get('volatility_percentile_high', 85)
-        
-        # Signal parameters
-        self.trend_strength_threshold = self.config.get('trend_strength_threshold', 0.02)  # 2%
+        self.trend_strength_threshold = self.config.get('trend_strength_threshold', 0.02)
         self.volatility_filter_enabled = self.config.get('volatility_filter_enabled', True)
+        self.enable_elliott_wave = self.config.get('enable_elliott_wave', False)
         
-        # Elliott Wave parameters (if enabled)
-        if self.enable_elliott_wave:
-            self.elliott_wave_periods = self.config.get('elliott_wave_periods', [5, 13, 21, 34, 55])
-            self.elliott_wave_threshold = self.config.get('elliott_wave_threshold', 0.618)
+        # RSI parameters
+        self.rsi_period = 14
+        self.rsi_overbought = 70
+        self.rsi_oversold = 30
+        
+        # MACD parameters
+        self.macd_fast = 12
+        self.macd_slow = 26
+        self.macd_signal = 9
+        
+        # Bollinger Bands parameters
+        self.bb_period = 20
+        self.bb_std = 2
+        
+        logger.info(f"Technical Analysis Module initialized with config: {self.config}")
     
-    def calculate_sma_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate SMA-based trend signals.
-        
-        Args:
-            df: DataFrame with OHLCV data
-            
-        Returns:
-            DataFrame with SMA signals
-        """
-        # Determine which price column to use
-        price_column = None
-        if 'close' in df.columns:
-            price_column = 'close'
-        elif 'mark_close' in df.columns:
-            price_column = 'mark_close'
-        elif 'index_close' in df.columns:
-            price_column = 'index_close'
-        else:
-            self.logger.warning("No price column found for SMA calculation, using neutral signals")
-            df['sma_trend'] = 0
-            df['trend_strength'] = 0
-            return df
-        
-        # Calculate SMAs
-        df[f'sma_{self.sma_short}'] = df[price_column].rolling(window=self.sma_short).mean()
-        df[f'sma_{self.sma_long}'] = df[price_column].rolling(window=self.sma_long).mean()
-        
-        # SMA trend signal
-        df['sma_trend'] = np.where(
-            df[f'sma_{self.sma_short}'] > df[f'sma_{self.sma_long}'], 1, -1
-        )
-        
-        # Trend strength (percentage difference)
-        df['trend_strength'] = abs(
-            (df[f'sma_{self.sma_short}'] - df[f'sma_{self.sma_long}']) / df[f'sma_{self.sma_long}']
-        )
-        
-        # Strong trend filter
-        df['strong_trend'] = df['trend_strength'] > self.trend_strength_threshold
-        
-        return df
+    def calculate_sma(self, prices: pd.Series, period: int) -> pd.Series:
+        """Calculate Simple Moving Average"""
+        return prices.rolling(window=period).mean()
     
-    def calculate_atr_volatility_filter(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate ATR-based volatility filter using percentile thresholds.
-        
-        Args:
-            df: DataFrame with OHLCV data
+    def calculate_ema(self, prices: pd.Series, period: int) -> pd.Series:
+        """Calculate Exponential Moving Average"""
+        return prices.ewm(span=period).mean()
+    
+    def calculate_atr(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = None) -> pd.Series:
+        """Calculate Average True Range (ATR)"""
+        if period is None:
+            period = self.atr_period
             
-        Returns:
-            DataFrame with volatility filter
-        """
-        # Determine which price columns to use
-        high_column = None
-        low_column = None
-        close_column = None
-        
-        if 'high' in df.columns and 'low' in df.columns and 'close' in df.columns:
-            high_column, low_column, close_column = 'high', 'low', 'close'
-        elif 'mark_high' in df.columns and 'mark_low' in df.columns and 'mark_close' in df.columns:
-            high_column, low_column, close_column = 'mark_high', 'mark_low', 'mark_close'
-        elif 'index_high' in df.columns and 'index_low' in df.columns and 'index_close' in df.columns:
-            high_column, low_column, close_column = 'index_high', 'index_low', 'index_close'
-        else:
-            self.logger.warning("No OHLC columns found for ATR calculation, using neutral filter")
-            df['volatility_filter'] = 1  # Allow all trades
-            return df
-        
-        # Calculate ATR
-        high_low = df[high_column] - df[low_column]
-        high_close = np.abs(df[high_column] - df[close_column].shift(1))
-        low_close = np.abs(df[low_column] - df[close_column].shift(1))
+        high_low = high - low
+        high_close = np.abs(high - close.shift(1))
+        low_close = np.abs(low - close.shift(1))
         
         true_range = np.maximum(high_low, np.maximum(high_close, low_close))
-        df['atr'] = true_range.rolling(window=self.atr_period).mean()
-        
-        # Calculate ATR/Price ratio
-        df['atr_price_ratio'] = df['atr'] / df[close_column]
-        
-        # Calculate rolling percentiles over volatility window
-        df['atr_price_p25'] = df['atr_price_ratio'].rolling(
-            window=self.volatility_window * 24,  # Assuming hourly data
-            min_periods=self.volatility_window * 4  # Minimum 4 days
-        ).quantile(self.volatility_percentile_low / 100)
-        
-        df['atr_price_p85'] = df['atr_price_ratio'].rolling(
-            window=self.volatility_window * 24,
-            min_periods=self.volatility_window * 4
-        ).quantile(self.volatility_percentile_high / 100)
-        
-        # Volatility filter: ATR/Price in [p25, p85] range
-        df['volatility_filter'] = (
-            (df['atr_price_ratio'] >= df['atr_price_p25']) &
-            (df['atr_price_ratio'] <= df['atr_price_p85'])
-        )
-        
-        return df
+        atr = true_range.rolling(window=period).mean()
+        return atr
     
-    def calculate_elliott_wave_signals(self, df: pd.DataFrame) -> pd.DataFrame:
-        """
-        Calculate Elliott Wave-based signals (optional feature).
-        
-        Args:
-            df: DataFrame with OHLCV data
+    def calculate_rsi(self, prices: pd.Series, period: int = None) -> pd.Series:
+        """Calculate Relative Strength Index (RSI)"""
+        if period is None:
+            period = self.rsi_period
             
-        Returns:
-            DataFrame with Elliott Wave signals
-        """
-        if not self.enable_elliott_wave:
-            df['elliott_wave_signal'] = 0
-            return df
-        
-        # Simple Elliott Wave implementation using Fibonacci retracements
-        df['elliott_wave_signal'] = 0
-        
-        # Determine which price columns to use
-        high_column = None
-        low_column = None
-        close_column = None
-        
-        if 'high' in df.columns and 'low' in df.columns and 'close' in df.columns:
-            high_column, low_column, close_column = 'high', 'low', 'close'
-        elif 'mark_high' in df.columns and 'mark_low' in df.columns and 'mark_close' in df.columns:
-            high_column, low_column, close_column = 'mark_high', 'mark_low', 'mark_close'
-        elif 'index_high' in df.columns and 'index_low' in df.columns and 'index_close' in df.columns:
-            high_column, low_column, close_column = 'index_high', 'index_low', 'index_close'
-        else:
-            self.logger.warning("No OHLC columns found for Elliott Wave calculation, using neutral signal")
-            return df
-        
-        for period in self.elliott_wave_periods:
-            # Calculate rolling high and low
-            rolling_high = df[high_column].rolling(window=period).max()
-            rolling_low = df[low_column].rolling(window=period).min()
-            
-            # Calculate Fibonacci levels
-            fib_range = rolling_high - rolling_low
-            fib_618 = rolling_low + (fib_range * self.elliott_wave_threshold)
-            fib_382 = rolling_high - (fib_range * self.elliott_wave_threshold)
-            
-            # Elliott Wave signals
-            bullish_wave = df[close_column] > fib_618
-            bearish_wave = df[close_column] < fib_382
-            
-            df['elliott_wave_signal'] += np.where(bullish_wave, 1, 0) - np.where(bearish_wave, 1, 0)
-        
-        # Normalize Elliott Wave signal
-        df['elliott_wave_signal'] = np.clip(df['elliott_wave_signal'] / len(self.elliott_wave_periods), -1, 1)
-        
-        return df
-    
-    def calculate_rsi_signals(self, df: pd.DataFrame, period: int = 14) -> pd.DataFrame:
-        """
-        Calculate RSI-based signals for additional confirmation.
-        
-        Args:
-            df: DataFrame with OHLCV data
-            period: RSI period
-            
-        Returns:
-            DataFrame with RSI signals
-        """
-        # Determine which price column to use
-        price_column = None
-        if 'close' in df.columns:
-            price_column = 'close'
-        elif 'mark_close' in df.columns:
-            price_column = 'mark_close'
-        elif 'index_close' in df.columns:
-            price_column = 'index_close'
-        else:
-            self.logger.warning("No price column found for RSI calculation, using neutral signals")
-            df['rsi'] = 50  # Neutral RSI
-            df['rsi_oversold'] = False
-            df['rsi_overbought'] = False
-            return df
-        
-        # Calculate RSI
-        delta = df[price_column].diff()
+        delta = prices.diff()
         gain = (delta.where(delta > 0, 0)).rolling(window=period).mean()
         loss = (-delta.where(delta < 0, 0)).rolling(window=period).mean()
         
         rs = gain / loss
-        df['rsi'] = 100 - (100 / (1 + rs))
-        
-        # RSI signals
-        df['rsi_oversold'] = df['rsi'] < 30
-        df['rsi_overbought'] = df['rsi'] > 70
-        
-        # RSI signal: -1 for oversold (bullish), +1 for overbought (bearish)
-        df['rsi_signal'] = np.where(df['rsi_oversold'], -1, 
-                                  np.where(df['rsi_overbought'], 1, 0))
-        
-        return df
+        rsi = 100 - (100 / (1 + rs))
+        return rsi
     
-    def generate_s_ta_signal(self, df: pd.DataFrame) -> pd.DataFrame:
+    def calculate_macd(self, prices: pd.Series, fast: int = None, slow: int = None, signal: int = None) -> Dict[str, pd.Series]:
+        """Calculate MACD (Moving Average Convergence Divergence)"""
+        if fast is None:
+            fast = self.macd_fast
+        if slow is None:
+            slow = self.macd_slow
+        if signal is None:
+            signal = self.macd_signal
+            
+        ema_fast = self.calculate_ema(prices, fast)
+        ema_slow = self.calculate_ema(prices, slow)
+        macd_line = ema_fast - ema_slow
+        signal_line = self.calculate_ema(macd_line, signal)
+        histogram = macd_line - signal_line
+        
+        return {
+            'macd': macd_line,
+            'signal': signal_line,
+            'histogram': histogram
+        }
+    
+    def calculate_bollinger_bands(self, prices: pd.Series, period: int = None, std: float = None) -> Dict[str, pd.Series]:
+        """Calculate Bollinger Bands"""
+        if period is None:
+            period = self.bb_period
+        if std is None:
+            std = self.bb_std
+            
+        sma = self.calculate_sma(prices, period)
+        std_dev = prices.rolling(window=period).std()
+        
+        upper_band = sma + (std_dev * std)
+        lower_band = sma - (std_dev * std)
+        
+        return {
+            'upper': upper_band,
+            'middle': sma,
+            'lower': lower_band
+        }
+    
+    def calculate_stochastic(self, high: pd.Series, low: pd.Series, close: pd.Series, k_period: int = 14, d_period: int = 3) -> Dict[str, pd.Series]:
+        """Calculate Stochastic Oscillator"""
+        lowest_low = low.rolling(window=k_period).min()
+        highest_high = high.rolling(window=k_period).max()
+        
+        k_percent = 100 * ((close - lowest_low) / (highest_high - lowest_low))
+        d_percent = k_percent.rolling(window=d_period).mean()
+        
+        return {
+            'k': k_percent,
+            'd': d_percent
+        }
+    
+    def calculate_volume_zscore(self, volume: pd.Series, window: int = 20) -> pd.Series:
+        """Calculate Volume Z-Score"""
+        volume_mean = volume.rolling(window=window).mean()
+        volume_std = volume.rolling(window=window).std()
+        volume_zscore = (volume - volume_mean) / volume_std
+        return volume_zscore
+    
+    def calculate_adx(self, high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
+        """Calculate Average Directional Index (ADX)"""
+        # Calculate True Range
+        tr = self.calculate_atr(high, low, close, 1)
+        
+        # Calculate Directional Movement
+        dm_plus = high.diff()
+        dm_minus = -low.diff()
+        
+        dm_plus = dm_plus.where((dm_plus > dm_minus) & (dm_plus > 0), 0)
+        dm_minus = dm_minus.where((dm_minus > dm_plus) & (dm_minus > 0), 0)
+        
+        # Calculate smoothed values
+        tr_smooth = tr.rolling(window=period).mean()
+        dm_plus_smooth = dm_plus.rolling(window=period).mean()
+        dm_minus_smooth = dm_minus.rolling(window=period).mean()
+        
+        # Calculate DI+ and DI-
+        di_plus = 100 * (dm_plus_smooth / tr_smooth)
+        di_minus = 100 * (dm_minus_smooth / tr_smooth)
+        
+        # Calculate DX
+        dx = 100 * np.abs(di_plus - di_minus) / (di_plus + di_minus)
+        
+        # Calculate ADX
+        adx = dx.rolling(window=period).mean()
+        
+        return adx
+    
+    def calculate_parabolic_sar(self, high: pd.Series, low: pd.Series, close: pd.Series, 
+                               acceleration: float = 0.02, maximum: float = 0.2) -> pd.Series:
+        """Calculate Parabolic SAR"""
+        psar = pd.Series(index=close.index, dtype=float)
+        trend = pd.Series(index=close.index, dtype=int)
+        af = pd.Series(index=close.index, dtype=float)
+        ep = pd.Series(index=close.index, dtype=float)
+        
+        # Initialize first values
+        psar.iloc[0] = low.iloc[0]
+        trend.iloc[0] = 1
+        af.iloc[0] = acceleration
+        ep.iloc[0] = high.iloc[0]
+        
+        for i in range(1, len(close)):
+            # Update trend
+            if trend.iloc[i-1] == 1:  # Uptrend
+                if low.iloc[i] <= psar.iloc[i-1]:
+                    trend.iloc[i] = -1
+                    psar.iloc[i] = ep.iloc[i-1]
+                    af.iloc[i] = acceleration
+                    ep.iloc[i] = low.iloc[i]
+                else:
+                    trend.iloc[i] = 1
+                    if high.iloc[i] > ep.iloc[i-1]:
+                        ep.iloc[i] = high.iloc[i]
+                        af.iloc[i] = min(af.iloc[i-1] + acceleration, maximum)
+                    else:
+                        ep.iloc[i] = ep.iloc[i-1]
+                        af.iloc[i] = af.iloc[i-1]
+                    psar.iloc[i] = psar.iloc[i-1] + af.iloc[i] * (ep.iloc[i] - psar.iloc[i-1])
+            else:  # Downtrend
+                if high.iloc[i] >= psar.iloc[i-1]:
+                    trend.iloc[i] = 1
+                    psar.iloc[i] = ep.iloc[i-1]
+                    af.iloc[i] = acceleration
+                    ep.iloc[i] = high.iloc[i]
+                else:
+                    trend.iloc[i] = -1
+                    if low.iloc[i] < ep.iloc[i-1]:
+                        ep.iloc[i] = low.iloc[i]
+                        af.iloc[i] = min(af.iloc[i-1] + acceleration, maximum)
+                    else:
+                        ep.iloc[i] = ep.iloc[i-1]
+                        af.iloc[i] = af.iloc[i-1]
+                    psar.iloc[i] = psar.iloc[i-1] + af.iloc[i] * (ep.iloc[i] - psar.iloc[i-1])
+        
+        return psar
+    
+    def calculate_support_resistance(self, high: pd.Series, low: pd.Series, close: pd.Series, 
+                                   window: int = 20, threshold: float = 0.02) -> Dict[str, List[float]]:
+        """Calculate Support and Resistance levels"""
+        # Find local maxima and minima
+        highs = high.rolling(window=window, center=True).max()
+        lows = low.rolling(window=window, center=True).min()
+        
+        # Identify pivot points
+        resistance_levels = []
+        support_levels = []
+        
+        for i in range(window, len(high) - window):
+            if high.iloc[i] == highs.iloc[i]:
+                resistance_levels.append(high.iloc[i])
+            if low.iloc[i] == lows.iloc[i]:
+                support_levels.append(low.iloc[i])
+        
+        # Filter levels by frequency and proximity
+        resistance_levels = self._filter_levels(resistance_levels, threshold)
+        support_levels = self._filter_levels(support_levels, threshold)
+        
+        return {
+            'resistance': resistance_levels,
+            'support': support_levels
+        }
+    
+    def _filter_levels(self, levels: List[float], threshold: float) -> List[float]:
+        """Filter support/resistance levels by frequency and proximity"""
+        if not levels:
+            return []
+        
+        # Group nearby levels
+        filtered_levels = []
+        levels_sorted = sorted(levels)
+        
+        current_group = [levels_sorted[0]]
+        
+        for level in levels_sorted[1:]:
+            if abs(level - current_group[-1]) / current_group[-1] <= threshold:
+                current_group.append(level)
+            else:
+                # Average the group and add to filtered levels
+                filtered_levels.append(np.mean(current_group))
+                current_group = [level]
+        
+        # Add the last group
+        if current_group:
+            filtered_levels.append(np.mean(current_group))
+        
+        return filtered_levels
+    
+    def calculate_elliott_wave(self, prices: pd.Series, periods: List[int] = None) -> Dict[str, Any]:
+        """Calculate Elliott Wave analysis (simplified implementation)"""
+        if not self.enable_elliott_wave:
+            return {'enabled': False}
+        
+        if periods is None:
+            periods = [5, 13, 21, 34, 55]
+        
+        # Simplified Elliott Wave implementation
+        # This is a basic version - full implementation would be much more complex
+        wave_analysis = {
+            'enabled': True,
+            'current_wave': 'unknown',
+            'wave_count': 0,
+            'fibonacci_levels': [],
+            'trend_direction': 'neutral'
+        }
+        
+        # Calculate Fibonacci retracement levels
+        recent_high = prices.rolling(window=20).max().iloc[-1]
+        recent_low = prices.rolling(window=20).min().iloc[-1]
+        price_range = recent_high - recent_low
+        
+        fibonacci_levels = [0.236, 0.382, 0.5, 0.618, 0.786]
+        wave_analysis['fibonacci_levels'] = [
+            recent_high - (level * price_range) for level in fibonacci_levels
+        ]
+        
+        # Simple trend detection
+        sma_short = self.calculate_sma(prices, 20)
+        sma_long = self.calculate_sma(prices, 50)
+        
+        if sma_short.iloc[-1] > sma_long.iloc[-1]:
+            wave_analysis['trend_direction'] = 'bullish'
+        elif sma_short.iloc[-1] < sma_long.iloc[-1]:
+            wave_analysis['trend_direction'] = 'bearish'
+        
+        return wave_analysis
+    
+    def analyze_technical_signals(self, df: pd.DataFrame) -> List[Dict[str, Any]]:
         """
-        Generate s_ta signal in [-1, +1] range combining all technical indicators.
+        Analyze technical indicators and generate trading signals.
         
         Args:
-            df: DataFrame with technical indicators
+            df: DataFrame with OHLCV data (columns: open, high, low, close, volume)
             
         Returns:
-            DataFrame with s_ta signal
+            List of technical analysis signals
         """
-        # Initialize s_ta signal
-        df['s_ta'] = 0.0
-        
-        # SMA trend signal (primary) - check if column exists
-        if 'sma_trend' in df.columns:
-            df['s_ta'] += df['sma_trend'] * 0.4
-        else:
-            self.logger.warning("sma_trend column not found, skipping SMA signal")
-        
-        # RSI confirmation signal - check if column exists
-        if 'rsi_signal' in df.columns:
-            df['s_ta'] += df['rsi_signal'] * 0.2
-        else:
-            self.logger.warning("rsi_signal column not found, skipping RSI signal")
-        
-        # Elliott Wave signal (if enabled) - check if column exists
-        if self.enable_elliott_wave and 'elliott_wave_signal' in df.columns:
-            df['s_ta'] += df['elliott_wave_signal'] * 0.2
-        elif self.enable_elliott_wave:
-            self.logger.warning("elliott_wave_signal column not found, skipping Elliott Wave signal")
-        
-        # Apply volatility filter - check if column exists
-        if self.volatility_filter_enabled and 'volatility_filter' in df.columns:
-            df['s_ta'] = np.where(df['volatility_filter'], df['s_ta'], 0)
-        elif self.volatility_filter_enabled:
-            self.logger.warning("volatility_filter column not found, skipping volatility filter")
-        
-        # Normalize to [-1, +1] range
-        df['s_ta'] = np.clip(df['s_ta'], -1, 1)
-        
-        # Add signal strength
-        df['s_ta_strength'] = abs(df['s_ta'])
-        
-        # Add signal confidence based on multiple confirmations
-        confirmations = 0
-        if 'sma_trend' in df.columns:
-            confirmations += 1
-        if 'rsi_signal' in df.columns:
-            confirmations += 1
-        if self.enable_elliott_wave and 'elliott_wave_signal' in df.columns:
-            confirmations += 1
-        
-        df['s_ta_confidence'] = df['s_ta_strength'] * (confirmations / 3.0)
-        
-        return df
+        try:
+            if df.empty or len(df) < max(self.sma_long, self.atr_period, self.rsi_period):
+                logger.warning("Insufficient data for technical analysis")
+                return []
+            
+            # Ensure we have the required columns
+            required_columns = ['open', 'high', 'low', 'close', 'volume']
+            if not all(col in df.columns for col in required_columns):
+                logger.error(f"Missing required columns. Available: {df.columns.tolist()}")
+                return []
+            
+            # Extract OHLCV data
+            open_prices = df['open']
+            high_prices = df['high']
+            low_prices = df['low']
+            close_prices = df['close']
+            volume = df['volume']
+            
+            # Calculate technical indicators
+            sma_short = self.calculate_sma(close_prices, self.sma_short)
+            sma_long = self.calculate_sma(close_prices, self.sma_long)
+            atr = self.calculate_atr(high_prices, low_prices, close_prices)
+            rsi = self.calculate_rsi(close_prices)
+            macd_data = self.calculate_macd(close_prices)
+            bb_data = self.calculate_bollinger_bands(close_prices)
+            stoch_data = self.calculate_stochastic(high_prices, low_prices, close_prices)
+            volume_zscore = self.calculate_volume_zscore(volume)
+            adx = self.calculate_adx(high_prices, low_prices, close_prices)
+            psar = self.calculate_parabolic_sar(high_prices, low_prices, close_prices)
+            
+            # Calculate support/resistance levels
+            sr_levels = self.calculate_support_resistance(high_prices, low_prices, close_prices)
+            
+            # Calculate Elliott Wave analysis
+            elliott_wave = self.calculate_elliott_wave(close_prices)
+            
+            # Generate signals
+            signals = []
+            
+            # Get the latest values
+            latest_idx = -1
+            current_price = close_prices.iloc[latest_idx]
+            current_sma_short = sma_short.iloc[latest_idx]
+            current_sma_long = sma_long.iloc[latest_idx]
+            current_rsi = rsi.iloc[latest_idx]
+            current_atr = atr.iloc[latest_idx]
+            current_macd = macd_data['macd'].iloc[latest_idx]
+            current_macd_signal = macd_data['signal'].iloc[latest_idx]
+            current_bb_upper = bb_data['upper'].iloc[latest_idx]
+            current_bb_lower = bb_data['lower'].iloc[latest_idx]
+            current_stoch_k = stoch_data['k'].iloc[latest_idx]
+            current_stoch_d = stoch_data['d'].iloc[latest_idx]
+            current_adx = adx.iloc[latest_idx]
+            current_psar = psar.iloc[latest_idx]
+            current_volume_zscore = volume_zscore.iloc[latest_idx]
+            
+            # Skip if any values are NaN
+            if pd.isna(current_sma_short) or pd.isna(current_sma_long) or pd.isna(current_rsi):
+                logger.warning("NaN values in technical indicators, skipping signal generation")
+                return []
+            
+            # Trend Analysis
+            trend_signal = 0.0
+            trend_strength = 0.0
+            
+            if current_sma_short > current_sma_long:
+                trend_signal = 1.0  # Bullish trend
+                trend_strength = (current_sma_short - current_sma_long) / current_sma_long
+            elif current_sma_short < current_sma_long:
+                trend_signal = -1.0  # Bearish trend
+                trend_strength = (current_sma_long - current_sma_short) / current_sma_long
+            
+            # RSI Analysis
+            rsi_signal = 0.0
+            if current_rsi > self.rsi_overbought:
+                rsi_signal = -1.0  # Overbought - potential sell
+            elif current_rsi < self.rsi_oversold:
+                rsi_signal = 1.0   # Oversold - potential buy
+            
+            # MACD Analysis
+            macd_signal = 0.0
+            if current_macd > current_macd_signal:
+                macd_signal = 1.0  # Bullish MACD
+            elif current_macd < current_macd_signal:
+                macd_signal = -1.0  # Bearish MACD
+            
+            # Bollinger Bands Analysis
+            bb_signal = 0.0
+            if current_price > current_bb_upper:
+                bb_signal = -1.0  # Price above upper band - potential sell
+            elif current_price < current_bb_lower:
+                bb_signal = 1.0   # Price below lower band - potential buy
+            
+            # Stochastic Analysis
+            stoch_signal = 0.0
+            if current_stoch_k > 80 and current_stoch_d > 80:
+                stoch_signal = -1.0  # Overbought
+            elif current_stoch_k < 20 and current_stoch_d < 20:
+                stoch_signal = 1.0   # Oversold
+            
+            # ADX Analysis (trend strength)
+            trend_strength_adx = 0.0
+            if not pd.isna(current_adx):
+                if current_adx > 25:
+                    trend_strength_adx = min(current_adx / 50, 1.0)  # Normalize to 0-1
+            
+            # Parabolic SAR Analysis
+            psar_signal = 0.0
+            if not pd.isna(current_psar):
+                if current_price > current_psar:
+                    psar_signal = 1.0  # Bullish SAR
+                elif current_price < current_psar:
+                    psar_signal = -1.0  # Bearish SAR
+            
+            # Volume Analysis
+            volume_signal = 0.0
+            if not pd.isna(current_volume_zscore):
+                if current_volume_zscore > 2:
+                    volume_signal = 1.0  # High volume - confirm signal
+                elif current_volume_zscore < -2:
+                    volume_signal = -1.0  # Low volume - weak signal
+            
+            # Volatility Filter
+            volatility_signal = 1.0  # Default: allow trading
+            if self.volatility_filter_enabled and not pd.isna(current_atr):
+                # Calculate volatility percentile
+                atr_percentile = (atr.rolling(window=self.volatility_window).rank(pct=True)).iloc[latest_idx]
+                if not pd.isna(atr_percentile):
+                    if atr_percentile < self.volatility_percentile_low / 100:
+                        volatility_signal = 0.5  # Low volatility - reduce signal strength
+                    elif atr_percentile > self.volatility_percentile_high / 100:
+                        volatility_signal = 0.5  # High volatility - reduce signal strength
+            
+            # Combine signals with weights
+            signal_components = {
+                'trend': trend_signal * 0.3,
+                'rsi': rsi_signal * 0.2,
+                'macd': macd_signal * 0.2,
+                'bollinger': bb_signal * 0.15,
+                'stochastic': stoch_signal * 0.1,
+                'psar': psar_signal * 0.05
+            }
+            
+            # Calculate combined signal
+            combined_signal = sum(signal_components.values()) * volatility_signal
+            
+            # Calculate confidence based on signal agreement
+            non_zero_signals = [abs(s) for s in signal_components.values() if s != 0]
+            signal_agreement = len(non_zero_signals) / len(signal_components) if signal_components else 0
+            
+            # Calculate confidence
+            confidence = min(signal_agreement * trend_strength_adx, 1.0)
+            
+            # Create signal object
+            signal = {
+                'timestamp': datetime.now().isoformat(),
+                'signal': combined_signal,
+                'confidence': confidence,
+                'trend_strength': trend_strength,
+                'components': signal_components,
+                'indicators': {
+                    'sma_short': current_sma_short,
+                    'sma_long': current_sma_long,
+                    'rsi': current_rsi,
+                    'atr': current_atr,
+                    'macd': current_macd,
+                    'macd_signal': current_macd_signal,
+                    'bb_upper': current_bb_upper,
+                    'bb_lower': current_bb_lower,
+                    'stoch_k': current_stoch_k,
+                    'stoch_d': current_stoch_d,
+                    'adx': current_adx,
+                    'psar': current_psar,
+                    'volume_zscore': current_volume_zscore
+                },
+                'support_resistance': sr_levels,
+                'elliott_wave': elliott_wave,
+                'volatility_filter': volatility_signal
+            }
+            
+            signals.append(signal)
+            
+            logger.info(f"Generated technical analysis signal: {combined_signal:.3f} (confidence: {confidence:.3f})")
+            
+            return signals
+            
+        except Exception as e:
+            logger.error(f"Error in technical analysis: {e}")
+            return []
     
-    def analyze_technical_signals(self, df: pd.DataFrame) -> pd.DataFrame:
+    def get_technical_summary(self, df: pd.DataFrame) -> Dict[str, Any]:
         """
-        Complete technical analysis pipeline.
+        Get a summary of technical analysis for the given data.
         
         Args:
             df: DataFrame with OHLCV data
             
         Returns:
-            DataFrame with all technical analysis signals
+            Dictionary with technical analysis summary
         """
-        self.logger.info("Starting technical analysis...")
-        
-        # Calculate all technical indicators
-        df = self.calculate_sma_signals(df)
-        df = self.calculate_atr_volatility_filter(df)
-        df = self.calculate_rsi_signals(df)
-        
-        if self.enable_elliott_wave:
-            df = self.calculate_elliott_wave_signals(df)
-        
-        # Generate final s_ta signal
-        df = self.generate_s_ta_signal(df)
-        
-        self.logger.info(f"Technical analysis completed. Generated s_ta signals: {df['s_ta'].describe()}")
-        
-        return df
-    
-    def get_latest_s_ta_signal(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Get the latest technical analysis signal.
-        
-        Args:
-            df: DataFrame with technical analysis data
+        try:
+            signals = self.analyze_technical_signals(df)
             
-        Returns:
-            Dictionary with latest signal information
-        """
-        if df.empty:
+            if not signals:
+                return {
+                    'status': 'error',
+                    'message': 'No signals generated',
+                    'timestamp': datetime.now().isoformat()
+                }
+            
+            latest_signal = signals[-1]
+            
             return {
-                's_ta': 0.0,
-                's_ta_strength': 0.0,
-                's_ta_confidence': 0.0,
-                'signal': 'HOLD',
+                'status': 'success',
+                'timestamp': datetime.now().isoformat(),
+                'signal': latest_signal['signal'],
+                'confidence': latest_signal['confidence'],
+                'trend_strength': latest_signal['trend_strength'],
+                'indicators': latest_signal['indicators'],
+                'components': latest_signal['components'],
+                'volatility_filter': latest_signal['volatility_filter']
+            }
+            
+        except Exception as e:
+            logger.error(f"Error getting technical summary: {e}")
+            return {
+                'status': 'error',
+                'message': str(e),
                 'timestamp': datetime.now().isoformat()
             }
-        
-        latest = df.iloc[-1]
-        
-        # Determine signal direction
-        if latest['s_ta'] > 0.1:
-            signal = 'SELL'
-        elif latest['s_ta'] < -0.1:
-            signal = 'BUY'
-        else:
-            signal = 'HOLD'
-        
-        return {
-            's_ta': float(latest['s_ta']),
-            's_ta_strength': float(latest['s_ta_strength']),
-            's_ta_confidence': float(latest['s_ta_confidence']),
-            'signal': signal,
-            'sma_trend': float(latest.get('sma_trend', 0)),
-            'rsi': float(latest.get('rsi', 50)),
-            'volatility_filter': bool(latest.get('volatility_filter', True)),
-            'timestamp': datetime.now().isoformat()
-        }
-    
-    def get_technical_summary(self, df: pd.DataFrame) -> Dict[str, Any]:
-        """
-        Get technical analysis summary statistics.
-        
-        Args:
-            df: DataFrame with technical analysis data
-            
-        Returns:
-            Dictionary with summary statistics
-        """
-        if df.empty:
-            return {}
-        
-        return {
-            'total_signals': len(df),
-            'buy_signals': len(df[df['s_ta'] < -0.1]),
-            'sell_signals': len(df[df['s_ta'] > 0.1]),
-            'hold_signals': len(df[(df['s_ta'] >= -0.1) & (df['s_ta'] <= 0.1)]),
-            'avg_s_ta': float(df['s_ta'].mean()),
-            'avg_confidence': float(df['s_ta_confidence'].mean()),
-            'volatility_filter_active': float(df['volatility_filter'].mean()),
-            'elliott_wave_enabled': self.enable_elliott_wave
-        }
 
 
-def main():
-    """Test the Technical Analysis Module."""
-    import sys
-    sys.path.append('src')
-    
-    # Setup logging
-    logging.basicConfig(level=logging.INFO)
-    
-    # Configuration
-    config = {
-        'sma_short': 20,
-        'sma_long': 100,
-        'atr_period': 14,
-        'volatility_window': 90,
-        'volatility_percentile_low': 25,
-        'volatility_percentile_high': 85,
-        'trend_strength_threshold': 0.02,
-        'volatility_filter_enabled': True,
-        'elliott_wave_periods': [5, 13, 21, 34, 55],
-        'elliott_wave_threshold': 0.618
-    }
-    
-    # Initialize technical analysis module
-    ta_module = TechnicalAnalysisModule(config=config, enable_elliott_wave=True)
-    
+# Example usage and testing
+if __name__ == "__main__":
     # Create sample data for testing
-    dates = pd.date_range(start='2024-01-01', end='2024-01-31', freq='H')
     np.random.seed(42)
+    dates = pd.date_range(start='2024-01-01', periods=200, freq='1H')
     
-    sample_data = pd.DataFrame({
-        'open_time': dates,
-        'open': 50000 + np.cumsum(np.random.randn(len(dates)) * 100),
-        'high': 0,
-        'low': 0,
-        'close': 0,
-        'volume': np.random.randint(1000, 10000, len(dates))
+    # Generate sample OHLCV data
+    base_price = 50000
+    returns = np.random.normal(0, 0.02, 200)
+    prices = [base_price]
+    
+    for ret in returns[1:]:
+        prices.append(prices[-1] * (1 + ret))
+    
+    df = pd.DataFrame({
+        'timestamp': dates,
+        'open': prices,
+        'high': [p * (1 + abs(np.random.normal(0, 0.01))) for p in prices],
+        'low': [p * (1 - abs(np.random.normal(0, 0.01))) for p in prices],
+        'close': prices,
+        'volume': np.random.uniform(1000, 10000, 200)
     })
     
-    # Generate realistic OHLCV data
-    for i in range(len(sample_data)):
-        base_price = sample_data.iloc[i]['open']
-        volatility = np.random.uniform(0.01, 0.03)
-        
-        sample_data.iloc[i, sample_data.columns.get_loc('high')] = base_price * (1 + volatility)
-        sample_data.iloc[i, sample_data.columns.get_loc('low')] = base_price * (1 - volatility)
-        sample_data.iloc[i, sample_data.columns.get_loc('close')] = base_price * (1 + np.random.uniform(-volatility, volatility))
+    # Initialize technical analysis module
+    config = {
+        'sma_short': 20,
+        'sma_long': 50,
+        'atr_period': 14,
+        'volatility_filter_enabled': True
+    }
     
-    # Run technical analysis
-    result_df = ta_module.analyze_technical_signals(sample_data)
+    ta_module = TechnicalAnalysisModule(config)
     
-    # Get latest signal
-    latest_signal = ta_module.get_latest_s_ta_signal(result_df)
+    # Generate signals
+    signals = ta_module.analyze_technical_signals(df)
     
-    print("Technical Analysis Test Results:")
-    print(f"Latest s_ta signal: {latest_signal['s_ta']:.4f}")
-    print(f"Signal: {latest_signal['signal']}")
-    print(f"Confidence: {latest_signal['s_ta_confidence']:.4f}")
-    
-    # Get summary
-    summary = ta_module.get_technical_summary(result_df)
-    print(f"\nSummary: {summary}")
-
-
-if __name__ == "__main__":
-    main()
+    if signals:
+        print("Technical Analysis Results:")
+        print(f"Signal: {signals[0]['signal']:.3f}")
+        print(f"Confidence: {signals[0]['confidence']:.3f}")
+        print(f"Trend Strength: {signals[0]['trend_strength']:.3f}")
+        print(f"Components: {signals[0]['components']}")
+    else:
+        print("No signals generated")

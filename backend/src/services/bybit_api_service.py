@@ -87,6 +87,46 @@ class BybitAPIService:
         
         self.logger.info(f"Bybit API Service initialized for {'testnet' if testnet else 'mainnet'}")
     
+    async def sync_time_with_server(self) -> Dict[str, Any]:
+        """
+        Synchronize local time with Bybit server time.
+        
+        Returns:
+            Time synchronization result
+        """
+        try:
+            # Get server time from Bybit
+            server_time_url = f"{self.base_url}/v5/market/time"
+            response = self.session.get(server_time_url, timeout=10)
+            response.raise_for_status()
+            
+            server_data = response.json()
+            if server_data.get('retCode') == 0:
+                server_timestamp = int(server_data['result']['timeSecond']) * 1000
+                local_timestamp = int(time.time() * 1000)
+                time_diff = server_timestamp - local_timestamp
+                
+                self.logger.info(f"Time sync: Server={server_timestamp}, Local={local_timestamp}, Diff={time_diff}ms")
+                
+                return {
+                    'success': True,
+                    'server_time': server_timestamp,
+                    'local_time': local_timestamp,
+                    'time_diff': time_diff,
+                    'synced': True
+                }
+            else:
+                return {
+                    'success': False,
+                    'error': f"Server time API error: {server_data.get('retMsg', 'Unknown error')}"
+                }
+        except Exception as e:
+            self.logger.error(f"Time synchronization failed: {e}")
+            return {
+                'success': False,
+                'error': str(e)
+            }
+    
     def _generate_signature(self, params: Dict[str, Any], timestamp: str, is_post: bool = False) -> str:
         """
         Generate HMAC SHA256 signature for Bybit API authentication.
@@ -113,7 +153,7 @@ class BybitAPIService:
         
         # Create signature payload (correct format for Bybit v5)
         # Format: timestamp + api_key + recv_window + param_string
-        signature_payload = f"{timestamp}{self.api_key}10000{param_string}"
+        signature_payload = f"{timestamp}{self.api_key}120000{param_string}"
         
         # Debug logging
         self.logger.debug(f"Signature payload: {signature_payload}")
@@ -141,7 +181,7 @@ class BybitAPIService:
         Returns:
             Headers dictionary with authentication
         """
-        # Use current timestamp in milliseconds
+        # Use current timestamp in milliseconds with time synchronization
         timestamp = str(int(time.time() * 1000))
         
         if params is None:
@@ -155,7 +195,7 @@ class BybitAPIService:
             'X-BAPI-SIGN': signature,
             'X-BAPI-SIGN-TYPE': '2',
             'X-BAPI-TIMESTAMP': timestamp,
-            'X-BAPI-RECV-WINDOW': '10000'  # Increased recv_window to 10 seconds
+            'X-BAPI-RECV-WINDOW': '120000'  # Increased recv_window to 120 seconds for better tolerance
         }
     
     async def get_wallet_balance(self, max_retries: int = 2) -> Dict[str, Any]:
@@ -569,12 +609,17 @@ class BybitAPIService:
     
     async def test_connection(self) -> Dict[str, Any]:
         """
-        Test API connection and authentication.
+        Test API connection and authentication with time synchronization.
         
         Returns:
             Connection test result
         """
         try:
+            # First, try to sync time with server
+            time_sync_result = await self.sync_time_with_server()
+            if not time_sync_result.get('success'):
+                self.logger.warning(f"Time sync failed: {time_sync_result.get('error')}")
+            
             # Test wallet balance endpoint
             balance_result = await self.get_wallet_balance()
             
@@ -583,12 +628,30 @@ class BybitAPIService:
                     'success': True,
                     'message': 'Bybit API connection successful',
                     'testnet': self.testnet,
+                    'time_sync': time_sync_result,
                     'timestamp': datetime.now().isoformat()
                 }
             else:
+                # If balance fails due to timestamp, try time sync and retry
+                if 'timestamp' in balance_result.get('error', '').lower():
+                    self.logger.info("Timestamp error detected, attempting time sync and retry...")
+                    time_sync_result = await self.sync_time_with_server()
+                    if time_sync_result.get('success'):
+                        # Retry balance after time sync
+                        balance_result = await self.get_wallet_balance()
+                        if balance_result['success']:
+                            return {
+                                'success': True,
+                                'message': 'Bybit API connection successful after time sync',
+                                'testnet': self.testnet,
+                                'time_sync': time_sync_result,
+                                'timestamp': datetime.now().isoformat()
+                            }
+                
                 return {
                     'success': False,
                     'error': balance_result.get('error', 'Unknown error'),
+                    'time_sync': time_sync_result,
                     'timestamp': datetime.now().isoformat()
                 }
                 
@@ -601,7 +664,7 @@ class BybitAPIService:
     
     async def get_order_history(self, symbol: str = None, max_retries: int = 2) -> Dict[str, Any]:
         """
-        Get order history from Bybit v5 API.
+        Get order history from Bybit v5 API with time synchronization.
         
         Args:
             symbol: Trading symbol (optional)
@@ -644,6 +707,15 @@ class BybitAPIService:
                 else:
                     error_msg = f"API error: {data.get('retMsg', 'Unknown error')}"
                     self.logger.error(error_msg)
+                    
+                    # If timestamp error, try time sync and retry
+                    if 'timestamp' in error_msg.lower() and attempt < max_retries - 1:
+                        self.logger.info("Timestamp error detected, attempting time sync...")
+                        time_sync_result = await self.sync_time_with_server()
+                        if time_sync_result.get('success'):
+                            self.logger.info("Time sync successful, retrying order history...")
+                            continue
+                    
                     if attempt < max_retries - 1:
                         self.logger.info(f"Retrying in 2 seconds... (attempt {attempt + 1}/{max_retries})")
                         await asyncio.sleep(2)
@@ -910,7 +982,7 @@ class BybitAPIService:
                 
                 # Generate headers with the exact JSON string
                 timestamp = str(int(time.time() * 1000))
-                signature_payload = f"{timestamp}{self.api_key}10000{json_string}"
+                signature_payload = f"{timestamp}{self.api_key}120000{json_string}"
                 signature = hmac.new(
                     self.api_secret.encode('utf-8'),
                     signature_payload.encode('utf-8'),
@@ -922,7 +994,7 @@ class BybitAPIService:
                     'X-BAPI-SIGN': signature,
                     'X-BAPI-SIGN-TYPE': '2',
                     'X-BAPI-TIMESTAMP': timestamp,
-                    'X-BAPI-RECV-WINDOW': '10000',
+                    'X-BAPI-RECV-WINDOW': '120000',
                     'Content-Type': 'application/json'
                 }
                 

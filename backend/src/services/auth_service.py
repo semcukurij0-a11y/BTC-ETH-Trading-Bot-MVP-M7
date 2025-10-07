@@ -16,7 +16,6 @@ import time
 from datetime import datetime, timedelta
 from typing import Dict, List, Optional, Any
 from fastapi import HTTPException, status
-from passlib.context import CryptContext
 import logging
 
 class AuthService:
@@ -39,8 +38,7 @@ class AuthService:
         self.access_token_expire_minutes = 30
         self.refresh_token_expire_days = 7
         
-        # Password hashing
-        self.pwd_context = CryptContext(schemes=["bcrypt"], deprecated="auto")
+        # Password hashing - using simple hash for demo purposes
         
         # Default users (in production, this would be in a database)
         self.users = {
@@ -77,12 +75,12 @@ class AuthService:
         return secrets.token_urlsafe(32)
     
     def _hash_password(self, password: str) -> str:
-        """Hash a password using bcrypt."""
-        return self.pwd_context.hash(password)
+        """Hash a password using SHA-256 (for demo purposes)."""
+        return hashlib.sha256(password.encode()).hexdigest()
     
     def _verify_password(self, plain_password: str, hashed_password: str) -> bool:
         """Verify a password against its hash."""
-        return self.pwd_context.verify(plain_password, hashed_password)
+        return self._hash_password(plain_password) == hashed_password
     
     def _create_access_token(self, data: Dict[str, Any]) -> str:
         """Create a JWT access token."""

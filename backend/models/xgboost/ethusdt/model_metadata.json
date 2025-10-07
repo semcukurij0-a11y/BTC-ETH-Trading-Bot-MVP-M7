@@ -1,0 +1,21 @@
+{
+  "symbol": "ethusdt",
+  "model_type": "xgboost",
+  "features_used": [
+    "log_return_shifted",
+    "atr_14_shifted",
+    "sma_20_shifted",
+    "sma_100_shifted",
+    "rsi_14_shifted",
+    "volume_zscore_shifted"
+  ],
+  "models_trained": [
+    "price_direction",
+    "price_volatility",
+    "log_return",
+    "future_return"
+  ],
+  "training_timestamp": "2025-10-07T13:17:32.248908",
+  "total_features": 6,
+  "total_samples": 14701
+}

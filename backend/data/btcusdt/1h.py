@@ -24,7 +24,9 @@ SLEEP_BETWEEN = 0.12
 RETRY_SLEEP = 1.0
 MAX_RETRIES = 3
 
-OUT_FILE = "1h_btc.parquet"
+# Get the directory where this script is located
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+OUT_FILE = os.path.join(SCRIPT_DIR, "1h_btc.parquet")
 
 
 # ---------- helpers ----------
@@ -126,16 +128,21 @@ def incremental_fetch_all_data():
     """Fetch OHLCV + mark + index price + funding + fear & greed and merge into one DataFrame"""
     interval_ms = 60 * 1000
 
+    # Debug: Show file status
+    print(f"Looking for parquet file: {OUT_FILE}")
+    print(f"File exists: {os.path.exists(OUT_FILE)}")
+
     # Load existing file if exists
     if os.path.exists(OUT_FILE):
         df_existing = pd.read_parquet(OUT_FILE)
         last_start = pd.to_datetime(df_existing["start_time"].max()).tz_convert(AWST_TZ)
         start_ms = int(last_start.timestamp() * 1000) + interval_ms
-        print(f"Existing data file, fetching after {last_start}")
+        print(f"[OK] Existing data file found, fetching after {last_start}")
+        print(f"   Existing file has {len(df_existing)} rows")
     else:
         df_existing = None
         start_ms = ms(START_DT)
-        print(f"No data file, starting from {START_DT}")
+        print(f"[ERROR] No data file found, starting from {START_DT}")
 
     end_ms = int(datetime.now(AWST_TZ).timestamp() * 1000)
     all_rows = []

@@ -283,8 +283,27 @@ async def get_trading_data(current_user: Dict[str, Any] = Depends(require_read_p
                             "margin": float(pos.get('positionIM', 0))
                         })
         
-        # Get orders (simplified - would need order history endpoint)
+        # Get real orders from Bybit
+        orders_result = await bybit_api.get_order_history()
         orders = []
+        if orders_result.get('success') and orders_result.get('data'):
+            orders_data = orders_result.get('data', {})
+            if 'list' in orders_data:
+                for order in orders_data['list']:
+                    orders.append({
+                        "order_id": order.get('orderId', ''),
+                        "symbol": order.get('symbol', ''),
+                        "side": order.get('side', ''),
+                        "order_type": order.get('orderType', ''),
+                        "quantity": float(order.get('qty', 0) or 0),
+                        "price": float(order.get('price', 0) or 0),
+                        "status": order.get('orderStatus', ''),
+                        "filled_quantity": float(order.get('cumExecQty', 0) or 0),
+                        "average_price": float(order.get('avgPrice', 0) or 0),
+                        "created_time": order.get('createdTime', ''),
+                        "updated_time": order.get('updatedTime', ''),
+                        "timestamp": datetime.now().isoformat()
+                    })
         
         # Calculate PnL from positions and wallet balance
         total_unrealized_pnl = sum(pos.get('unrealized_pnl', 0) for pos in positions)
@@ -819,75 +838,327 @@ async def get_dashboard_data(current_user: Dict[str, Any] = Depends(require_read
 # Trading Signals Endpoint
 @app.get("/trading/signals")
 async def get_trading_signals(current_user: Dict[str, Any] = Depends(require_read_permission)):
-    """Get real trading signals using live market data."""
+    """
+    Get trading signals using trained XGBoost models with CSV fallback.
+    
+    Primary flow: Load XGBoost models (log_return_model.pkl, future_return_model.pkl) 
+    from models/xgboost/{symbol}/ and generate signals based on:
+    - future_return prediction -> signal direction (BUY/SELL/HOLD)
+    - log_return prediction -> confidence level
+    - Combined -> position size calculation
+    
+    Fallback flow: Read latest signals from leveraged_backtest_results/{symbol}_trades.csv
+    - Use signal only if timestamp is within 1 hour of current time
+    - Set HOLD signal if CSV data is older than 1 hour
+    """
     try:
-        # Import simple signal generator
-        from services.simple_signal_generator import SimpleSignalGenerator
+        import joblib
+        import numpy as np
+        import pandas as pd
+        from pathlib import Path
+        from datetime import timedelta
         
-        # Initialize signal generator with Bybit API - only BTCUSDT and ETHUSDT
-        signal_generator = SimpleSignalGenerator(bybit_api, {
-            'symbols': ['BTCUSDT', 'ETHUSDT'],
-            'signal_threshold': 0.2
-        })
+        # Model-based signal generation
+        signals = []
+        symbols = ['BTCUSDT', 'ETHUSDT']
         
-        # Generate real signals using live market data
-        result = await signal_generator.get_live_signals()
-        
-        if result.get('success'):
-            return {
-                "success": True,
-                "signals": result.get('signals', []),
-                "count": result.get('count', 0),
-                "timestamp": result.get('timestamp', datetime.now().isoformat()),
-                "generator": result.get('generator', 'real_signal_generator'),
-                "symbols_analyzed": result.get('symbols_analyzed', 0)
-            }
-        else:
-            # Fallback to mock data if real signal generation fails
-            print(f"Real signal generation failed: {result.get('error')}")
-            print("Falling back to mock signals")
-            
-            mock_signals = [
-                {
-                    "symbol": "BTCUSDT",
-                    "signal": 0.623,
-                    "confidence": 0.78,
+        for symbol in symbols:
+            try:
+                # Load feature data for the symbol
+                feature_file = f"feature/{symbol.lower()}/{symbol.lower()}_features.parquet"
+                if not os.path.exists(feature_file):
+                    print(f"Feature file not found for {symbol}: {feature_file}")
+                    continue
+                
+                # Load the latest feature data
+                df_features = pd.read_parquet(feature_file)
+                if df_features.empty:
+                    print(f"No feature data available for {symbol}")
+                    continue
+                
+                # Get the most recent row
+                latest_row = df_features.iloc[-1].copy()
+                
+                # Prepare features for model prediction (shifted features only)
+                shifted_features = [
+                    'log_return_shifted', 'atr_14_shifted', 'sma_20_shifted', 
+                    'sma_100_shifted', 'rsi_14_shifted', 'volume_zscore_shifted'
+                ]
+                
+                # Check if all required features are available
+                missing_features = [f for f in shifted_features if f not in latest_row.index]
+                if missing_features:
+                    print(f"Missing features for {symbol}: {missing_features}")
+                    continue
+                
+                # Extract feature values
+                feature_values = latest_row[shifted_features].values.reshape(1, -1)
+                
+                # Load models for the symbol
+                model_dir = f"models/xgboost/{symbol.lower()}"
+                models = {}
+                
+                for model_name in ['log_return_model.pkl', 'future_return_model.pkl']:
+                    model_path = os.path.join(model_dir, model_name)
+                    if os.path.exists(model_path):
+                        model_data = joblib.load(model_path)
+                        models[model_name] = model_data
+                
+                if not models:
+                    print(f"No models found for {symbol}")
+                    continue
+                
+                # Generate predictions
+                predictions = {}
+                for model_name, model_data in models.items():
+                    try:
+                        model = model_data['model']
+                        scaler = model_data['scaler']
+                        
+                        # Scale features
+                        scaled_features = scaler.transform(feature_values)
+                        
+                        # Make prediction
+                        prediction = model.predict(scaled_features)[0]
+                        predictions[model_name] = prediction
+                        
+                    except Exception as e:
+                        print(f"Error predicting with {model_name} for {symbol}: {e}")
+                        continue
+                
+                # Convert predictions to trading signal
+                signal = 0.0
+                confidence = 0.0
+                position_size = 0.0
+                
+                if 'log_return_model.pkl' in predictions and 'future_return_model.pkl' in predictions:
+                    log_return_pred = predictions['log_return_model.pkl']
+                    future_return_pred = predictions['future_return_model.pkl']
+                    
+                    # Generate trading signal from model predictions
+                    # Future return prediction is the primary signal driver
+                    # Log return prediction is used for confidence/strength
+                    
+                    # Signal generation logic:
+                    # - Positive future return -> BUY signal
+                    # - Negative future return -> SELL signal
+                    # - Log return magnitude -> confidence level
+                    
+                    signal_threshold = 0.001  # Minimum threshold for signal generation
+                    
+                    if abs(future_return_pred) > signal_threshold:
+                        # Determine signal direction based on future return
+                        if future_return_pred > 0:
+                            signal = 1.0  # BUY signal
+                        else:
+                            signal = -1.0  # SELL signal
+                        
+                        # Calculate confidence based on log return magnitude
+                        confidence = min(abs(log_return_pred) * 10, 1.0)  # Scale and cap at 1.0
+                        
+                        # Calculate position size based on signal strength and confidence
+                        # Stronger signals and higher confidence = larger position
+                        signal_strength = abs(future_return_pred)
+                        position_size = min(signal_strength * confidence * 0.1, 0.2)  # Cap at 20% position
+                        
+                    else:
+                        # Signal below threshold -> HOLD
+                        signal = 0.0
+                        confidence = 0.0
+                        position_size = 0.0
+                
+                # Create signal response
+                signal_data = {
+                    "symbol": symbol,
+                    "signal": signal,
+                    "confidence": confidence,
+                    "position_size": position_size,
                     "components": {
-                        "ml": 0.456,
-                        "technical": 0.234,
-                        "sentiment": 0.145,
-                        "fear_greed": 0.089
+                        "ml_log_return": predictions.get('log_return_model.pkl', 0.0),
+                        "ml_future_return": predictions.get('future_return_model.pkl', 0.0),
+                        "technical": 0.0,  # Could be enhanced with technical indicators
+                        "sentiment": 0.0   # Could be enhanced with sentiment data
                     },
-                    "timestamp": datetime.now().isoformat()
-                },
-                {
-                    "symbol": "ETHUSDT",
-                    "signal": -0.234,
-                    "confidence": 0.65,
-                    "components": {
-                        "ml": -0.123,
-                        "technical": -0.089,
-                        "sentiment": -0.067,
-                        "fear_greed": 0.045
-                    },
-                    "timestamp": datetime.now().isoformat()
+                    "timestamp": datetime.now().isoformat(),
+                    "source": "xgboost_models"
                 }
-            ]
-            
-            return {
-                "success": True,
-                "signals": mock_signals,
-                "count": len(mock_signals),
-                "timestamp": datetime.now().isoformat(),
-                "generator": "mock_fallback"
-            }
+                
+                signals.append(signal_data)
+                
+            except Exception as e:
+                print(f"Error generating signal for {symbol}: {e}")
+                continue
+        
+        # If model-based signals failed, try CSV fallback
+        if not signals:
+            print("Model-based signal generation failed, trying CSV fallback...")
+            signals = await get_csv_fallback_signals()
+        
+        return {
+            "success": True,
+            "signals": signals,
+            "count": len(signals),
+            "timestamp": datetime.now().isoformat(),
+            "generator": "xgboost_models" if signals else "csv_fallback"
+        }
             
     except Exception as e:
         print(f"Signal generation error: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Trading signals failed: {str(e)}"
-        )
+        # Final fallback to CSV
+        try:
+            signals = await get_csv_fallback_signals()
+            return {
+                "success": True,
+                "signals": signals,
+                "count": len(signals),
+                "timestamp": datetime.now().isoformat(),
+                "generator": "csv_fallback"
+            }
+        except Exception as csv_error:
+            print(f"CSV fallback also failed: {csv_error}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"Trading signals failed: {str(e)}"
+            )
+
+
+async def get_csv_fallback_signals():
+    """Get signals from recent CSV files as fallback."""
+    try:
+        import pandas as pd
+        from datetime import timedelta
+        
+        signals = []
+        symbols = ['btcusdt', 'ethusdt']
+        current_time = datetime.now()
+        
+        for symbol in symbols:
+            # Use new file naming convention: {symbol}_trades.csv
+            csv_file = f"leveraged_backtest_results/{symbol}_trades.csv"
+            
+            if not os.path.exists(csv_file):
+                print(f"CSV file not found: {csv_file}")
+                continue
+            
+            try:
+                # Read the CSV file
+                df = pd.read_csv(csv_file)
+                if df.empty:
+                    print(f"Empty CSV file: {csv_file}")
+                    continue
+                
+                # Get the most recent trade
+                latest_trade = df.iloc[-1]
+                
+                # Check timestamp (assuming 'timestamp' column exists)
+                if 'timestamp' in latest_trade:
+                    try:
+                        # Parse timestamp
+                        trade_time = pd.to_datetime(latest_trade['timestamp'])
+                        time_diff = current_time - trade_time.replace(tzinfo=None)
+                        
+                        # Check if within 1 hour
+                        if time_diff <= timedelta(hours=1):
+                            # Extract signal information from trade data
+                            signal_value = 0.0
+                            confidence = 0.5  # Default confidence for CSV fallback
+                            position_size = 0.0
+                            
+                            # Try to extract signal from trade data
+                            if 'action' in latest_trade:
+                                action = latest_trade['action']
+                                if action == 'BUY':
+                                    signal_value = 1.0  # BUY signal
+                                    position_size = 0.1  # Default position size for CSV fallback
+                                elif action == 'SELL':
+                                    signal_value = -1.0  # SELL signal
+                                    position_size = 0.1  # Default position size for CSV fallback
+                                else:
+                                    signal_value = 0.0  # HOLD
+                                    position_size = 0.0
+                            
+                            signal_data = {
+                                "symbol": symbol.upper(),
+                                "signal": signal_value,
+                                "confidence": confidence,
+                                "position_size": position_size,
+                                "components": {
+                                    "ml": 0.0,
+                                    "technical": 0.0,
+                                    "sentiment": 0.0,
+                                    "csv_fallback": signal_value
+                                },
+                                "timestamp": datetime.now().isoformat(),
+                                "source": "csv_fallback"
+                            }
+                            
+                            signals.append(signal_data)
+                            print(f"Using CSV fallback signal for {symbol.upper()}: {signal_value}")
+                        else:
+                            print(f"CSV timestamp too old for {symbol.upper()}: {time_diff}")
+                            # Set HOLD signal for old data (timestamp > 1 hour)
+                            signal_data = {
+                                "symbol": symbol.upper(),
+                                "signal": 0.0,
+                                "confidence": 0.0,
+                                "position_size": 0.0,
+                                "components": {
+                                    "ml": 0.0,
+                                    "technical": 0.0,
+                                    "sentiment": 0.0,
+                                    "csv_fallback": "old_data"
+                                },
+                                "timestamp": datetime.now().isoformat(),
+                                "source": "csv_fallback_hold"
+                            }
+                            signals.append(signal_data)
+                    
+                    except Exception as time_error:
+                        print(f"Error parsing timestamp for {symbol}: {time_error}")
+                        # Set HOLD signal for parsing errors
+                        signal_data = {
+                            "symbol": symbol.upper(),
+                            "signal": 0.0,
+                            "confidence": 0.0,
+                            "position_size": 0.0,
+                            "components": {
+                                "ml": 0.0,
+                                "technical": 0.0,
+                                "sentiment": 0.0,
+                                "csv_fallback": "parse_error"
+                            },
+                            "timestamp": datetime.now().isoformat(),
+                            "source": "csv_fallback_error"
+                        }
+                        signals.append(signal_data)
+                        continue
+                else:
+                    # No timestamp column - set HOLD signal
+                    signal_data = {
+                        "symbol": symbol.upper(),
+                        "signal": 0.0,
+                        "confidence": 0.0,
+                        "position_size": 0.0,
+                        "components": {
+                            "ml": 0.0,
+                            "technical": 0.0,
+                            "sentiment": 0.0,
+                            "csv_fallback": "no_timestamp"
+                        },
+                        "timestamp": datetime.now().isoformat(),
+                        "source": "csv_fallback_no_timestamp"
+                    }
+                    signals.append(signal_data)
+                
+            except Exception as csv_error:
+                print(f"Error reading CSV file {csv_file}: {csv_error}")
+                continue
+        
+        return signals
+        
+    except Exception as e:
+        print(f"CSV fallback error: {e}")
+        return []
 
 # Close Position Endpoint
 @app.post("/trading/positions/close")
@@ -1004,7 +1275,7 @@ async def pause_trading(current_user: Dict[str, Any] = Depends(require_write_per
     """Pause trading system."""
     try:
         # Mock pause implementation
-        print("⏸️ Trading system paused")
+        print("Trading system paused")
         return {
             "success": True,
             "message": "Trading system paused successfully",
@@ -1023,7 +1294,7 @@ async def resume_trading(current_user: Dict[str, Any] = Depends(require_write_pe
     """Resume trading system."""
     try:
         # Mock resume implementation
-        print("▶️ Trading system resumed")
+        print("Trading system resumed")
         return {
             "success": True,
             "message": "Trading system resumed successfully",
@@ -1042,7 +1313,7 @@ async def activate_kill_switch(current_user: Dict[str, Any] = Depends(require_wr
     """Activate kill switch - flatten all positions and halt trading."""
     try:
         # Mock kill switch implementation
-        print("🚨 KILL SWITCH ACTIVATED")
+        print("KILL SWITCH ACTIVATED")
         print("   - All positions will be flattened")
         print("   - All orders will be cancelled")
         print("   - New entries blocked until reset")
@@ -1065,7 +1336,7 @@ async def reset_kill_switch(current_user: Dict[str, Any] = Depends(require_write
     """Reset kill switch - allow trading to resume."""
     try:
         # Mock reset implementation
-        print("🔄 Kill switch reset - trading can resume")
+        print("Kill switch reset - trading can resume")
         
         return {
             "success": True,
@@ -1148,28 +1419,7 @@ async def get_trading_risk(current_user: Dict[str, Any] = Depends(require_read_p
             detail=f"Trading risk failed: {str(e)}"
         )
 
-# Control endpoints
-@app.post("/trading/pause")
-async def pause_trading(current_user: Dict[str, Any] = Depends(require_write_permission)):
-    """Pause trading activity."""
-    try:
-        return {"success": True, "message": "Trading paused"}
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Pause trading failed: {str(e)}"
-        )
-
-@app.post("/trading/resume")
-async def resume_trading(current_user: Dict[str, Any] = Depends(require_write_permission)):
-    """Resume trading activity."""
-    try:
-        return {"success": True, "message": "Trading resumed"}
-    except Exception as e:
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail=f"Resume trading failed: {str(e)}"
-        )
+# Control endpoints (duplicates removed - using the more complete implementations above)
 
 # Automatic Trading endpoints
 @app.post("/trading/auto/start")

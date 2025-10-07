@@ -1,625 +1,31 @@
 #!/usr/bin/env python3
 """
-Leveraged Trading Signal Backtest System
+Leveraged Backtest - 3x Leverage Implementation with Success Criteria
 
-A comprehensive backtesting system for leveraged cryptocurrency trading with:
-- 5x leverage support
-- Cross-asset correlation analysis
-- Advanced risk management
-- Technical indicator calculations
-- Signal generation and position sizing
+Advanced Requirements with Leverage:
+- 3x leverage for enhanced returns
+- Entry refinement: MFE ≥ 30 realistic 
+- Tight stops: MAE ≤ 10 with leverage
+- Exit strategy: ATR-based stops with 1.5:1 risk/reward ratio (tighter stops for higher win rate)
+- Success criteria: Sharpe ≥ 1.2, Avg gain ≥ 1-2%, Max DD ≤ 1-1.5%
+
+Author: Quant Developer
+Date: 2024
 """
 
 import os
-import warnings
-from datetime import datetime, timedelta
-from typing import Dict, List, Any, Optional, Tuple
-import argparse
-import requests
-import time
-
-import numpy as np
 import pandas as pd
+import numpy as np
+from datetime import datetime
+from typing import Dict, List, Any, Optional
+import warnings
+from scipy import stats
 from scipy.stats import pearsonr
-
+import itertools
 warnings.filterwarnings('ignore')
 
-# Available cryptocurrency assets for trading
-AVAILABLE_ASSETS = {
-    'BTC': 'BTCUSDT',
-    'BNB': 'BNBUSDT', 
-    'ETH': 'ETHUSDT',
-    'SOL': 'SOLUSDT',
-    'XRP': 'XRPUSDT',
-    'AVAX': 'AVAXUSDT',
-    'ADA': 'ADAUSDT',
-    'DOT': 'DOTUSDT',
-    'LTC': 'LTCUSDT',
-    'LINK': 'LINKUSDT'
-}
-
-def load_data_from_parquet(symbol: str, data_dir: str = 'data') -> pd.DataFrame:
-    """
-    Load data from parquet files in the data directory.
-    
-    Args:
-        symbol: Trading pair symbol (e.g., 'BTCUSDT', 'ETHUSDT')
-        data_dir: Directory containing parquet files
-        
-    Returns:
-        DataFrame with OHLCV data
-    """
-    # Map symbols to their respective directories and files
-    symbol_mapping = {
-        'BTCUSDT': ('btcusdt', '1h_btc.parquet'),
-        'ETHUSDT': ('ethusdt', '1h_eth.parquet')
-    }
-    
-    if symbol not in symbol_mapping:
-        print(f"Symbol {symbol} not supported for parquet loading")
-        return pd.DataFrame()
-    
-    folder, filename = symbol_mapping[symbol]
-    
-    # Get the directory where the script is located
-    script_dir = os.path.dirname(os.path.abspath(__file__))
-    parquet_path = os.path.join(script_dir, data_dir, folder, filename)
-    
-    if not os.path.exists(parquet_path):
-        print(f"Parquet file not found: {parquet_path}")
-        print(f"Current working directory: {os.getcwd()}")
-        print(f"Script directory: {script_dir}")
-        return pd.DataFrame()
-    
-    try:
-        print(f"Loading {symbol} data from {parquet_path}...")
-        df = pd.read_parquet(parquet_path)
-        
-        # Rename columns to match expected format
-        column_mapping = {
-            'start_time': 'timestamp',
-            'open': 'open',
-            'high': 'high', 
-            'low': 'low',
-            'close': 'close',
-            'volume': 'volume'
-        }
-        
-        # Keep only the columns we need and rename them
-        df = df[list(column_mapping.keys())].rename(columns=column_mapping)
-        
-        # Convert timestamp to datetime and make it timezone-naive
-        df['timestamp'] = pd.to_datetime(df['timestamp'])
-        # Convert to timezone-naive if timezone-aware
-        if df['timestamp'].dt.tz is not None:
-            df['timestamp'] = df['timestamp'].dt.tz_localize(None)
-        df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        print(f"Successfully loaded {len(df)} rows of {symbol} data from parquet")
-        return df
-        
-    except Exception as e:
-        print(f"Error loading parquet data for {symbol}: {e}")
-            return pd.DataFrame()
-        
-        
-
-def backup_csv_file(csv_file_path: str) -> str:
-    """
-    Create a backup of the CSV file before making changes.
-    
-    Args:
-        csv_file_path: Path to the CSV file to backup
-        
-    Returns:
-        Path to the backup file
-    """
-    if not os.path.exists(csv_file_path):
-        return ""
-    
-    try:
-        # Create backup directory
-        backup_dir = os.path.join(os.path.dirname(csv_file_path), 'backups')
-        os.makedirs(backup_dir, exist_ok=True)
-        
-        # Generate backup filename with timestamp
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.basename(csv_file_path)
-        name, ext = os.path.splitext(filename)
-        backup_filename = f"{name}_backup_{timestamp}{ext}"
-        backup_path = os.path.join(backup_dir, backup_filename)
-        
-        # Copy file to backup location
-        import shutil
-        shutil.copy2(csv_file_path, backup_path)
-        
-        print(f"Created backup: {backup_path}")
-        return backup_path
-        
-    except Exception as e:
-        print(f"Error creating backup: {e}")
-        return ""
-
-def clean_existing_csv_file(csv_file_path: str, symbol: str) -> bool:
-    """
-    Clean an existing CSV file by removing corrupted data and fixing timestamps.
-    
-    Args:
-        csv_file_path: Path to the CSV file to clean
-        symbol: Trading symbol for context
-        
-    Returns:
-        True if cleaning was successful, False otherwise
-    """
-    try:
-        print(f"Cleaning existing CSV file for {symbol}...")
-        
-        # Create backup first
-        backup_path = backup_csv_file(csv_file_path)
-        if not backup_path:
-            print(f"Failed to create backup for {symbol}")
-            return False
-        
-        # Read the CSV file
-        df = pd.read_csv(csv_file_path)
-        original_count = len(df)
-        print(f"Original data: {original_count} rows")
-        
-        # Clean the data
-        df_clean = clean_ohlcv_data(df, symbol)
-        cleaned_count = len(df_clean)
-        
-        if cleaned_count < original_count:
-            removed_count = original_count - cleaned_count
-            print(f"Removed {removed_count} corrupted rows ({removed_count/original_count*100:.1f}%)")
-            
-            # Save cleaned data
-            df_clean.to_csv(csv_file_path, index=False)
-            print(f"Saved cleaned data: {cleaned_count} rows")
-            return True
-        else:
-            print(f"No corrupted data found for {symbol}")
-            return True
-            
-    except Exception as e:
-        print(f"Error cleaning CSV file for {symbol}: {e}")
-        return False
-
-def clean_ohlcv_data(df: pd.DataFrame, symbol: str) -> pd.DataFrame:
-    """
-    Clean and fix OHLCV data to ensure data integrity.
-    
-    Args:
-        df: DataFrame with OHLCV data
-        symbol: Trading symbol for context
-        
-    Returns:
-        Cleaned DataFrame
-    """
-    if df.empty:
-        return df
-    
-    df_clean = df.copy()
-    
-    # Clean timestamp column first
-    if 'timestamp' in df_clean.columns:
-        # Try to convert timestamp to proper datetime format
-        try:
-            # First try to parse as datetime
-            df_clean['timestamp'] = pd.to_datetime(df_clean['timestamp'], errors='coerce')
-            
-            # Remove rows with invalid timestamps
-            valid_timestamp_mask = df_clean['timestamp'].notna()
-            if not valid_timestamp_mask.all():
-                invalid_timestamp_count = (~valid_timestamp_mask).sum()
-                print(f"Removing {invalid_timestamp_count} rows with invalid timestamps for {symbol}")
-                df_clean = df_clean[valid_timestamp_mask]
-            
-            # Convert back to Unix timestamp (milliseconds)
-            df_clean['timestamp'] = df_clean['timestamp'].astype('int64') // 10**6
-            
-        except Exception as e:
-            print(f"Error processing timestamps for {symbol}: {e}")
-            # Fallback: try to convert to numeric
-            df_clean['timestamp'] = pd.to_numeric(df_clean['timestamp'], errors='coerce')
-            valid_timestamp_mask = (df_clean['timestamp'] > 0) & df_clean['timestamp'].notna()
-            if not valid_timestamp_mask.all():
-                invalid_timestamp_count = (~valid_timestamp_mask).sum()
-                print(f"Removing {invalid_timestamp_count} rows with invalid timestamps for {symbol}")
-                df_clean = df_clean[valid_timestamp_mask]
-    
-    # Ensure core OHLCV columns exist and are numeric
-    ohlcv_columns = ['open', 'high', 'low', 'close', 'volume']
-    for col in ohlcv_columns:
-        if col in df_clean.columns:
-            # Convert to numeric, coercing errors to NaN
-            df_clean[col] = pd.to_numeric(df_clean[col], errors='coerce')
-            
-            # Replace any non-positive values with the previous valid value
-            if col in ['open', 'high', 'low', 'close']:
-                # For price columns, ensure they're positive
-                df_clean[col] = df_clean[col].replace([0, -0], np.nan)
-                df_clean[col] = df_clean[col].fillna(method='ffill').fillna(method='bfill')
-                
-                # Ensure high >= max(open, close) and low <= min(open, close)
-                if col == 'high':
-                    df_clean[col] = df_clean[col].clip(lower=df_clean[['open', 'close']].max(axis=1))
-                elif col == 'low':
-                    df_clean[col] = df_clean[col].clip(upper=df_clean[['open', 'close']].min(axis=1))
-    
-    # Remove any rows where core OHLCV data is still invalid
-    valid_mask = (
-        df_clean['open'].notna() & 
-        df_clean['high'].notna() & 
-        df_clean['low'].notna() & 
-        df_clean['close'].notna() &
-        (df_clean['open'] > 0) &
-        (df_clean['high'] > 0) &
-        (df_clean['low'] > 0) &
-        (df_clean['close'] > 0)
-    )
-    
-    if not valid_mask.all():
-        invalid_count = (~valid_mask).sum()
-        print(f"Cleaned {invalid_count} invalid OHLCV rows for {symbol}")
-        df_clean = df_clean[valid_mask]
-    
-    return df_clean
-
-def validate_data_integrity(df: pd.DataFrame, symbol: str) -> bool:
-    """
-    Validate the integrity of the data before saving.
-    
-    Args:
-        df: DataFrame to validate
-        symbol: Trading symbol for context
-        
-    Returns:
-        True if data is valid, False otherwise
-    """
-    try:
-        # Check basic structure
-        if df.empty:
-            print(f"Warning: {symbol} data is empty")
-            return False
-        
-        # Check required columns
-        required_columns = ['timestamp', 'open', 'high', 'low', 'close', 'volume']
-        missing_columns = [col for col in required_columns if col not in df.columns]
-        if missing_columns:
-            print(f"Warning: {symbol} missing required columns: {missing_columns}")
-            return False
-        
-        # Check for duplicate timestamps
-        if 'timestamp' in df.columns:
-            duplicate_timestamps = df['timestamp'].duplicated().sum()
-            if duplicate_timestamps > 0:
-                print(f"Warning: {symbol} has {duplicate_timestamps} duplicate timestamps")
-                # For incremental updates, we'll allow some duplicates but warn
-                if duplicate_timestamps > len(df) * 0.01:  # More than 1% duplicates
-                    print(f"Too many duplicates ({duplicate_timestamps} > {len(df) * 0.01:.0f}). Data integrity compromised.")
-                    return False
-                else:
-                    print(f"Acceptable number of duplicates for incremental update.")
-        
-        # Check for reasonable price values
-        price_columns = ['open', 'high', 'low', 'close']
-        for col in price_columns:
-            if col in df.columns:
-                if df[col].isna().sum() > len(df) * 0.1:  # More than 10% NaN
-                    print(f"Warning: {symbol} has too many NaN values in {col}")
-                    return False
-                
-                # Check for non-positive values but allow some tolerance for synthetic data
-                non_positive_count = (df[col] <= 0).sum()
-                if non_positive_count > 0:
-                    non_positive_pct = non_positive_count / len(df) * 100
-                    if non_positive_pct > 5:  # More than 5% non-positive values
-                        print(f"Warning: {symbol} has {non_positive_count} non-positive values in {col} ({non_positive_pct:.1f}%)")
-                        return False
-                    else:
-                        print(f"Info: {symbol} has {non_positive_count} non-positive values in {col} ({non_positive_pct:.1f}%) - acceptable for synthetic data")
-        
-        # Check volume
-        if 'volume' in df.columns:
-            if df['volume'].isna().sum() > len(df) * 0.1:
-                print(f"Warning: {symbol} has too many NaN values in volume")
-                return False
-        
-        print(f"Data integrity check passed for {symbol}")
-        return True
-        
-    except Exception as e:
-        print(f"Error validating data integrity for {symbol}: {e}")
-        return False
-
-
-
-def select_asset() -> str:
-    """
-    Interactive asset selection from available cryptocurrencies.
-    
-    Returns:
-        Selected asset symbol (e.g., 'BTCUSDT')
-    """
-    print("\nAvailable Cryptocurrency Assets:")
-    print("=" * 40)
-    
-    for i, (short_name, full_symbol) in enumerate(AVAILABLE_ASSETS.items(), 1):
-        print(f"{i:2d}. {short_name:4s} ({full_symbol})")
-    
-    while True:
-        try:
-            choice = input(f"\nSelect asset (1-{len(AVAILABLE_ASSETS)}): ").strip()
-            choice_num = int(choice)
-            
-            if 1 <= choice_num <= len(AVAILABLE_ASSETS):
-                selected_asset = list(AVAILABLE_ASSETS.values())[choice_num - 1]
-                short_name = list(AVAILABLE_ASSETS.keys())[choice_num - 1]
-                print(f"Selected: {short_name} ({selected_asset})")
-                return selected_asset
-            else:
-                print(f"Please enter a number between 1 and {len(AVAILABLE_ASSETS)}")
-                
-        except ValueError:
-            print("Please enter a valid number")
-        except KeyboardInterrupt:
-            print("\nExiting...")
-            exit(0)
-
-def get_data_period() -> Tuple[str, str]:
-    """
-    Get start and end dates for data fetching.
-    
-    Returns:
-        Tuple of (start_date, end_date) in 'YYYY-MM-DD' format
-    """
-    print("\nData Period Selection:")
-    print("=" * 30)
-    
-    # Default to last 12 months
-    end_date = datetime.now()
-    start_date = end_date - timedelta(days=365)
-    
-    print(f"Default period: {start_date.strftime('%Y-%m-%d')} to {end_date.strftime('%Y-%m-%d')} (12 months)")
-    
-    use_default = input("Use default period? (y/n): ").strip().lower()
-    
-    if use_default in ['y', 'yes', '']:
-        return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
-    
-    while True:
-        try:
-            start_input = input("Enter start date (YYYY-MM-DD): ").strip()
-            if start_input:
-                start_date = datetime.strptime(start_input, '%Y-%m-%d')
-            
-            end_input = input("Enter end date (YYYY-MM-DD): ").strip()
-            if end_input:
-                end_date = datetime.strptime(end_input, '%Y-%m-%d')
-            
-            if start_date >= end_date:
-                print("Start date must be before end date")
-                continue
-                
-            if (end_date - start_date).days > 365:
-                print("Warning: Period is longer than 1 year. This may take a while...")
-                confirm = input("Continue? (y/n): ").strip().lower()
-                if confirm not in ['y', 'yes']:
-                    continue
-            
-            return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
-            
-        except ValueError:
-            print("Invalid date format. Please use YYYY-MM-DD")
-        except KeyboardInterrupt:
-            print("\nExiting...")
-            exit(0)
-
-def get_backtest_period() -> Tuple[str, str]:
-    """
-    Get start and end dates for backtest analysis period.
-    
-    Returns:
-        Tuple of (start_date, end_date) in YYYY-MM-DD format, or (None, None) for all data
-    """
-    print("\nBacktest Period Selection:")
-    print("=" * 30)
-    print("1. Last 1 month")
-    print("2. Last 3 months")
-    print("3. Last 6 months") 
-    print("4. Last 12 months")
-    print("5. Last 2 years")
-    print("6. Custom period")
-    print("7. Use all available data")
-    
-    while True:
-        try:
-            choice = input("Enter choice (1-7): ").strip()
-            if choice == '1':
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=30)
-                return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
-            elif choice == '2':
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=90)
-                return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
-            elif choice == '3':
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=180)
-                return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
-            elif choice == '4':
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=365)
-                return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
-            elif choice == '5':
-                end_date = datetime.now()
-                start_date = end_date - timedelta(days=730)
-                return start_date.strftime('%Y-%m-%d'), end_date.strftime('%Y-%m-%d')
-            elif choice == '6':
-                start_date = input("Enter start date (YYYY-MM-DD): ").strip()
-                end_date = input("Enter end date (YYYY-MM-DD): ").strip()
-                
-                # Validate date format
-                datetime.strptime(start_date, '%Y-%m-%d')
-                datetime.strptime(end_date, '%Y-%m-%d')
-                
-                # Validate date range
-                start_dt = datetime.strptime(start_date, '%Y-%m-%d')
-                end_dt = datetime.strptime(end_date, '%Y-%m-%d')
-                if start_dt >= end_dt:
-                    print("Start date must be before end date.")
-                    continue
-                
-                return start_date, end_date
-            elif choice == '7':
-                return None, None  # Use all available data
-            else:
-                print("Invalid choice. Please enter 1-7.")
-        except ValueError:
-            print("Invalid date format. Please use YYYY-MM-DD format.")
-        except KeyboardInterrupt:
-            print("\nOperation cancelled.")
-            return None, None
-
-def filter_data_by_period(df: pd.DataFrame, start_date: str = None, end_date: str = None) -> pd.DataFrame:
-    """
-    Filter DataFrame by date period for backtest analysis.
-    
-    Args:
-        df: DataFrame with timestamp column
-        start_date: Start date in YYYY-MM-DD format (optional)
-        end_date: End date in YYYY-MM-DD format (optional)
-        
-    Returns:
-        Filtered DataFrame
-    """
-    if start_date is None and end_date is None:
-        print("Using all available data for backtest")
-        return df
-    
-    # Convert timestamp column to datetime if it's not already
-    if 'timestamp' in df.columns:
-        df_copy = df.copy()
-        df_copy['timestamp'] = pd.to_datetime(df_copy['timestamp'])
-        
-        # Apply date filters
-        if start_date:
-            start_dt = pd.to_datetime(start_date)
-            df_copy = df_copy[df_copy['timestamp'] >= start_dt]
-            print(f"Filtered data from {start_date}")
-        
-        if end_date:
-            end_dt = pd.to_datetime(end_date)
-            df_copy = df_copy[df_copy['timestamp'] <= end_dt]
-            print(f"Filtered data until {end_date}")
-        
-        print(f"Backtest period: {df_copy['timestamp'].min().strftime('%Y-%m-%d')} to {df_copy['timestamp'].max().strftime('%Y-%m-%d')}")
-        print(f"Data points for backtest: {len(df_copy)} rows")
-        
-        return df_copy
-    else:
-        print("Warning: No timestamp column found. Using all data.")
-        return df
-
-def save_trades_to_csv(trades: List[Dict], symbol: str, results: Dict) -> str:
-    """
-    Save backtest trades to a professional CSV file.
-    
-    Args:
-        trades: List of trade dictionaries
-        symbol: Trading symbol
-        results: Backtest results dictionary
-        
-    Returns:
-        Path to the saved CSV file
-    """
-    if not trades:
-        print("No trades to save")
-        return ""
-    
-    # Create output directory
-    output_dir = 'backtest_trades'
-    os.makedirs(output_dir, exist_ok=True)
-    
-    # Generate filename with timestamp
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    filename = f"{symbol}_trades_{timestamp}.csv"
-    filepath = os.path.join(output_dir, filename)
-    
-    # Convert trades to DataFrame
-    df_trades = pd.DataFrame(trades)
-    
-    # Add summary information as metadata
-    summary_info = {
-        'symbol': symbol,
-        'total_return': results.get('total_return', 0),
-        'sharpe_ratio': results.get('sharpe_ratio', 0),
-        'max_drawdown': results.get('max_drawdown', 0),
-        'total_trades': results.get('total_trades', 0),
-        'win_rate': results.get('win_rate', 0),
-        'avg_gain_per_trade_pct': results.get('avg_gain_per_trade_pct', 0),
-        'margin_calls': results.get('margin_calls', 0),
-        'leverage': results.get('leverage', 10),
-        'profit_factor': results.get('profit_factor', 0),
-        'gross_profit': results.get('gross_profit', 0),
-        'gross_loss': results.get('gross_loss', 0),
-        'largest_win': results.get('largest_win', 0),
-        'largest_loss': results.get('largest_loss', 0),
-        'win_loss_ratio': results.get('win_loss_ratio', 0),
-        'backtest_date': datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    }
-    
-    # Create a comprehensive CSV with summary and trades
-    with open(filepath, 'w', newline='', encoding='utf-8') as f:
-        # Write summary header
-        f.write("# LEVERAGED BACKTEST TRADES REPORT\n")
-        f.write(f"# Symbol: {summary_info['symbol']}\n")
-        f.write(f"# Backtest Date: {summary_info['backtest_date']}\n")
-        f.write(f"# Total Return: {summary_info['total_return']:.2%}\n")
-        f.write(f"# Sharpe Ratio: {summary_info['sharpe_ratio']:.4f}\n")
-        f.write(f"# Max Drawdown: {summary_info['max_drawdown']:.2%}\n")
-        f.write(f"# Total Trades: {summary_info['total_trades']}\n")
-        f.write(f"# Win Rate: {summary_info['win_rate']:.2%}\n")
-        f.write(f"# Avg Gain per Trade: {summary_info['avg_gain_per_trade_pct']:.4f}%\n")
-        f.write(f"# Margin Calls: {summary_info['margin_calls']}\n")
-        f.write(f"# Leverage: {summary_info['leverage']}x\n")
-        
-        # Profit Factor metrics
-        profit_factor = summary_info['profit_factor']
-        if profit_factor == float('inf'):
-            f.write(f"# Profit Factor: ∞ (No losses)\n")
-        else:
-            f.write(f"# Profit Factor: {profit_factor:.2f}\n")
-        
-        f.write(f"# Gross Profit: ${summary_info['gross_profit']:.2f}\n")
-        f.write(f"# Gross Loss: ${summary_info['gross_loss']:.2f}\n")
-        f.write(f"# Largest Win: ${summary_info['largest_win']:.2f}\n")
-        f.write(f"# Largest Loss: ${summary_info['largest_loss']:.2f}\n")
-        f.write(f"# Win/Loss Ratio: {summary_info['win_loss_ratio']:.2f}\n")
-        f.write("#\n")
-        
-        # Write trades data
-        df_trades.to_csv(f, index=False)
-    
-    print(f"Trades saved to: {filepath}")
-    print(f"Total trades exported: {len(trades)}")
-    
-    return filepath
-
 def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int = 14) -> pd.Series:
-    """
-    Calculate Average True Range (ATR) for volatility measurement.
-    
-    Args:
-        high: High price series
-        low: Low price series  
-        close: Close price series
-        period: Rolling window period for ATR calculation
-        
-    Returns:
-        ATR series with same length as input data
-    """
+    """Calculate Average True Range (ATR)."""
     high_low = high - low
     high_close = np.abs(high - close.shift())
     low_close = np.abs(low - close.shift())
@@ -628,299 +34,78 @@ def calculate_atr(high: pd.Series, low: pd.Series, close: pd.Series, period: int
     atr = true_range.rolling(window=period).mean()
     return atr
 
-def calculate_correlation_strength(corr_value: float) -> float:
-    """
-    Convert correlation value to normalized signal strength (0-1 scale).
-    
-    Args:
-        corr_value: Correlation coefficient (-1 to 1)
-        
-    Returns:
-        Signal strength value between 0.0 and 1.0
-    """
-    if pd.isna(corr_value):
-        return 0.0
-    
-    abs_corr = abs(corr_value)
-    
-    if abs_corr >= 0.8:
-        return 0.9
-    elif abs_corr >= 0.6:
-        return 0.7
-    elif abs_corr >= 0.4:
-        return 0.5
-    elif abs_corr >= 0.2:
-        return 0.3
-    else:
-        return 0.1
-
-def calculate_cointegration_strength(residual: float, threshold: float = 2.0) -> float:
-    """
-    Calculate cointegration signal strength based on residual deviation from mean.
-    
-    Args:
-        residual: Cointegration residual value
-        threshold: Base threshold for signal strength calculation
-        
-    Returns:
-        Signal strength value between 0.0 and 1.0
-    """
-    if pd.isna(residual):
-        return 0.0
-    
-    abs_residual = abs(residual)
-    
-    if abs_residual >= threshold * 2:
-        return 0.9
-    elif abs_residual >= threshold:
-        return 0.7
-    elif abs_residual >= threshold * 0.5:
-        return 0.5
-    elif abs_residual >= threshold * 0.25:
-        return 0.3
-    else:
-        return 0.1
-
-def calculate_cross_asset_signal_strength(row: pd.Series, symbol: str) -> Dict[str, float]:
-    """
-    Calculate cross-asset signal strength using top 3-5 most correlated assets.
-    
-    Args:
-        row: Data row containing correlation and residual columns
-        symbol: Trading symbol for analysis
-        
-    Returns:
-        Dictionary containing signal strength components
-    """
-    signal_components = {
-        'correlation_strength': 0.0,
-        'cointegration_strength': 0.0,
-        'residual_strength': 0.0,
-        'cross_asset_confidence': 0.0
-    }
-    
-    # Get correlation columns for this symbol
-    corr_columns = [col for col in row.index if col.startswith('corr_return_1_vs_') and col.endswith('USDT')]
-    
-    if not corr_columns:
-        return signal_components
-    
-    # Focus on top 3-5 most correlated assets (simplified approach)
-    corr_values = []
-    for col in corr_columns:
-        corr_value = row.get(col, 0)
-        if not pd.isna(corr_value):
-            corr_values.append((col, abs(corr_value)))  # Use absolute correlation
-    
-    # Sort by correlation strength and take top 5
-    corr_values.sort(key=lambda x: x[1], reverse=True)
-    top_correlations = corr_values[:5]  # Top 5 most correlated assets
-    
-    # Calculate correlation strength from top assets only
-    if top_correlations:
-        top_corr_strengths = [calculate_correlation_strength(corr_value) for _, corr_value in top_correlations]
-        signal_components['correlation_strength'] = np.mean(top_corr_strengths)
-    
-    # Get corresponding residual columns for top correlated assets
-    top_asset_names = [col.replace('corr_return_1_vs_', '') for col, _ in top_correlations]
-    residual_columns = [f'residual_return_1_vs_{asset}' for asset in top_asset_names 
-                       if f'residual_return_1_vs_{asset}' in row.index]
-    
-    # Calculate cointegration strength from top assets only
-    if residual_columns:
-        residual_strengths = []
-        for col in residual_columns:
-            residual_value = row.get(col, 0)
-            if not pd.isna(residual_value):
-                residual_strengths.append(calculate_cointegration_strength(residual_value))
-        
-        if residual_strengths:
-            signal_components['cointegration_strength'] = np.mean(residual_strengths)
-            signal_components['residual_strength'] = np.mean(residual_strengths)
-    
-    # Calculate cross-asset confidence from top assets only
-    if residual_columns:
-        cross_asset_signals = []
-        for col in residual_columns:
-            residual_value = row.get(col, 0)
-            if not pd.isna(residual_value):
-                # Strong divergence (potential reversal signal)
-                if abs(residual_value) > 2.0:
-                    cross_asset_signals.append(0.8)
-                # Moderate divergence
-                elif abs(residual_value) > 1.0:
-                    cross_asset_signals.append(0.6)
-                # Weak divergence
-                elif abs(residual_value) > 0.5:
-                    cross_asset_signals.append(0.4)
-                else:
-                    cross_asset_signals.append(0.2)
-        
-        if cross_asset_signals:
-            signal_components['cross_asset_confidence'] = np.mean(cross_asset_signals)
-    
-    return signal_components
 
 def calculate_kelly_fraction(returns: List[float], min_trades: int = 10) -> float:
-    """
-    Calculate Kelly fraction for optimal position sizing based on historical returns.
-    
-    Args:
-        returns: List of historical trade returns
-        min_trades: Minimum number of trades required for calculation
-        
-    Returns:
-        Kelly fraction between 0.05 and 0.5 (5% to 50%)
-    """
+    """Calculate Kelly fraction based on historical returns."""
     if len(returns) < min_trades:
-        return 0.25
+        return 0.25  # Default conservative fraction
     
     returns_array = np.array(returns)
     
+    # Calculate win rate and average win/loss
     wins = returns_array[returns_array > 0]
     losses = returns_array[returns_array < 0]
     
     if len(wins) == 0 or len(losses) == 0:
-        return 0.25
+        return 0.25  # Default if no wins or losses
     
     win_rate = len(wins) / len(returns)
     avg_win = np.mean(wins)
     avg_loss = abs(np.mean(losses))
     
+    # Kelly formula: f = (bp - q) / b
+    # where b = avg_win/avg_loss, p = win_rate, q = 1 - win_rate
     if avg_loss == 0:
-        return 0.25
+        return 0.25  # Avoid division by zero
     
     b = avg_win / avg_loss
     p = win_rate
     q = 1 - win_rate
     
     kelly_fraction = (b * p - q) / b
-    return max(0.05, min(0.5, kelly_fraction))
-
-def calculate_profit_factor(trades: List[Dict[str, Any]]) -> Dict[str, float]:
-    """
-    Calculate profit factor and related trading metrics from trade history.
     
-    Args:
-        trades: List of trade dictionaries containing trade data
-        
-    Returns:
-        Dictionary containing profit factor and related metrics
-    """
-    if not trades:
-        return {
-            'profit_factor': 0.0,
-            'gross_profit': 0.0,
-            'gross_loss': 0.0,
-            'total_profit_trades': 0,
-            'total_loss_trades': 0,
-            'largest_win': 0.0,
-            'largest_loss': 0.0,
-            'avg_win': 0.0,
-            'avg_loss': 0.0,
-            'win_loss_ratio': 0.0
-        }
+    # Constrain Kelly fraction to reasonable bounds
+    kelly_fraction = max(0.05, min(0.5, kelly_fraction))  # Between 5% and 50%
     
-    # Extract profit/loss data from trades
-    profits = []
-    losses = []
-    profit_trades = 0
-    loss_trades = 0
-    
-    for trade in trades:
-        if trade.get('action') == 'SELL' and 'profit_loss' in trade:
-            pnl = trade['profit_loss']
-            if pnl > 0:
-                profits.append(pnl)
-                profit_trades += 1
-            elif pnl < 0:
-                losses.append(abs(pnl))  # Store as positive values
-                loss_trades += 1
-    
-    # Calculate metrics
-    gross_profit = sum(profits) if profits else 0.0
-    gross_loss = sum(losses) if losses else 0.0
-    
-    # Calculate profit factor
-    if gross_loss == 0:
-        profit_factor = float('inf') if gross_profit > 0 else 0.0
-    else:
-        profit_factor = gross_profit / gross_loss
-    
-    # Additional metrics
-    largest_win = max(profits) if profits else 0.0
-    largest_loss = max(losses) if losses else 0.0
-    avg_win = np.mean(profits) if profits else 0.0
-    avg_loss = np.mean(losses) if losses else 0.0
-    
-    # Win/Loss ratio (average win / average loss)
-    if avg_loss == 0:
-        win_loss_ratio = float('inf') if avg_win > 0 else 0.0
-    else:
-        win_loss_ratio = avg_win / avg_loss
-    
-    return {
-        'profit_factor': profit_factor,
-        'gross_profit': gross_profit,
-        'gross_loss': gross_loss,
-        'total_profit_trades': profit_trades,
-        'total_loss_trades': loss_trades,
-        'largest_win': largest_win,
-        'largest_loss': largest_loss,
-        'avg_win': avg_win,
-        'avg_loss': avg_loss,
-        'win_loss_ratio': win_loss_ratio
-    }
+    return kelly_fraction
 
 class LeveragedBacktestEngine:
-    """
-    Leveraged backtesting engine with 5x leverage and conservative risk management.
-    
-    This engine provides comprehensive backtesting capabilities for leveraged cryptocurrency
-    trading with advanced features including:
-    - Cross-asset correlation analysis
-    - Dynamic position sizing using Kelly criterion
-    - ATR-based stop losses and profit targets
-    - Volatility regime filtering
-    - Risk management with drawdown limits
-    """
+    """Leveraged backtesting engine with 5x leverage and conservative risk management."""
     
     def __init__(self, 
                  initial_capital: float = 10000.0,
-                 leverage: float = 5.0,
+                 leverage: float = 5.0,  # 5x leverage
                  commission: float = 0.0001,
                  slippage: float = 0.00005,
-                 max_position_size: float = 0.10,
-                 base_position_size: float = 0.05,
-                 stop_loss_pct: float = 0.001,
-                 profit_target_pct: float = 0.008,
-                 trailing_stop_pct: float = 0.15,
-                 use_atr_stops: bool = True,
-                 atr_multiplier: float = 0.6,
-                 atr_profit_multiplier: float = 3.0,
-                 atr_period: int = 14,
-                 use_trend_following: bool = True,
-                 use_fixed_take_profit: bool = False,
-                 use_fixed_stop_loss: bool = True,
-                 use_kelly_sizing: bool = True,
-                 kelly_lookback: int = 50,
-                 kelly_fraction_multiplier: float = 1.0,
-                 use_volatility_filter: bool = False,
-                 volatility_threshold: float = 0.03,
-                 min_liquidity_hours: List[int] = None,
-                 max_drawdown_limit: float = 0.015,
-                 daily_stop_loss: float = 0.01,
-                 min_cross_asset_confirmations: int = 1,
-                 cointegration_threshold: float = 1.5,
-                 use_volatility_regime_filter: bool = True,
-                 max_atr_threshold: float = 0.67,
-                 min_signal_strength: float = 0.4,
-                 min_confidence: float = 0.3,
-                 min_target_return: float = 0.002,
-                 max_portfolio_risk: float = 0.02,
-                 margin_call_threshold: float = 0.8,
-                 cross_asset_lookback: int = 100):
+                 max_position_size: float = 0.20,  # 20.0% of capital (5x = 100% exposure)
+                 base_position_size: float = 0.10,  # 10.0% base (5x = 50% exposure)
+                 stop_loss_pct: float = 0.001,  # 0.1% stop loss (tight for leverage)
+                 profit_target_pct: float = 0.008,  # 0.8% profit target
+                 trailing_stop_pct: float = 0.15,  # 15% trailing stop
+                 use_atr_stops: bool = True,  # Use ATR-based stops
+                 atr_multiplier: float = 0.6,  # 0.6× ATR multiplier (very tight stops for lower volatility)
+                 atr_profit_multiplier: float = 3.0,  # Base ATR profit multiplier (dynamic 2.5-3.5)
+                 atr_period: int = 14,  # ATR period
+                 use_trend_following: bool = True,  # Use trend-following exit signals instead of fixed TP
+                 use_fixed_take_profit: bool = False,  # Use fixed take-profit (disabled for trend-following)
+                 use_fixed_stop_loss: bool = True,  # Keep stop-loss for risk management
+                 use_kelly_sizing: bool = True,  # Use Kelly fraction for position sizing
+                 kelly_lookback: int = 50,  # Number of trades to look back for Kelly calculation
+                 kelly_fraction_multiplier: float = 1.0,  # Kelly fraction scaling multiplier
+                 use_volatility_filter: bool = False,  # Use volatility filter to avoid extreme noise (disabled for more trades)
+                 volatility_threshold: float = 0.03,  # 3% volatility threshold (balanced for trade execution)
+                 min_liquidity_hours: List[int] = None,  # Hours to avoid trading (low liquidity)
+                 max_drawdown_limit: float = 0.015,  # 1.5% maximum drawdown limit (strict risk control)
+                 daily_stop_loss: float = 0.01,  # 1% daily stop-loss limit
+                 use_volatility_regime_filter: bool = True,  # Use volatility regime filter to avoid noisy conditions
+                 max_atr_threshold: float = 0.67,  # Skip trades if ATR > 67.0% (allows more crypto volatility)
+                 min_signal_strength: float = 0.4,  # Very relaxed threshold for maximum opportunities (40%)
+                 min_confidence: float = 0.3,      # Very relaxed threshold for maximum opportunities (30%)
+                 min_target_return: float = 0.002,  # 0.2% minimum expected return
+                 max_portfolio_risk: float = 0.02,  # 2% max portfolio risk
+                 margin_call_threshold: float = 0.8):  # 80% margin call threshold
         
+        # Core parameters
         self.initial_capital = initial_capital
         self.leverage = leverage
         self.commission = commission
@@ -942,11 +127,9 @@ class LeveragedBacktestEngine:
         self.kelly_fraction_multiplier = kelly_fraction_multiplier
         self.use_volatility_filter = use_volatility_filter
         self.volatility_threshold = volatility_threshold
-        self.min_liquidity_hours = min_liquidity_hours or [22, 23, 0, 1, 2, 3, 4, 5]
+        self.min_liquidity_hours = min_liquidity_hours or [22, 23, 0, 1, 2, 3, 4, 5]  # Default: avoid late night/early morning
         self.max_drawdown_limit = max_drawdown_limit
         self.daily_stop_loss = daily_stop_loss
-        self.min_cross_asset_confirmations = min_cross_asset_confirmations
-        self.cointegration_threshold = cointegration_threshold
         self.use_volatility_regime_filter = use_volatility_regime_filter
         self.max_atr_threshold = max_atr_threshold
         self.min_signal_strength = min_signal_strength
@@ -954,11 +137,8 @@ class LeveragedBacktestEngine:
         self.min_target_return = min_target_return
         self.max_portfolio_risk = max_portfolio_risk
         self.margin_call_threshold = margin_call_threshold
-        self.cross_asset_lookback = cross_asset_lookback
         
-        self.cross_asset_data = {}
-        self.cross_asset_returns = {}
-        
+        # Trading state
         self.capital = initial_capital
         self.available_margin = initial_capital
         self.used_margin = 0.0
@@ -970,10 +150,12 @@ class LeveragedBacktestEngine:
         self.losing_trades = 0
         self.margin_calls = 0
         
+        # Drawdown tracking
         self.peak_capital = initial_capital
         self.current_drawdown = 0.0
         self.trading_halted = False
         
+        # Daily tracking
         self.daily_start_capital = initial_capital
         self.current_date = None
         self.daily_loss = 0.0
@@ -991,17 +173,19 @@ class LeveragedBacktestEngine:
         self.losing_trades = 0
         self.margin_calls = 0
         
+        # Reset drawdown tracking
         self.peak_capital = self.initial_capital
         self.current_drawdown = 0.0
         self.trading_halted = False
     
     def get_timestamp_column(self, df: pd.DataFrame) -> str:
         """Get timestamp column."""
-        timestamp_cols = ['timestamps', 'timestamp', 'open_time', 'close_time']
-        for col in timestamp_cols:
-            if col in df.columns:
-                return col
-        raise ValueError("No timestamp column found. Expected one of: timestamps, timestamp, open_time, close_time")
+        if 'start_time' in df.columns:
+            return 'start_time'
+        elif 'timestamps' in df.columns:
+            return 'timestamps'
+        else:
+            return 'timestamp'
     
     def calculate_margin_requirements(self, position_value: float) -> float:
         """Calculate margin requirement for leveraged position."""
@@ -1014,29 +198,35 @@ class LeveragedBacktestEngine:
     
     def calculate_dynamic_profit_multiplier(self, df: pd.DataFrame, current_atr: float) -> float:
         """Calculate dynamic profit multiplier based on market conditions."""
-        base_multiplier = self.atr_profit_multiplier
+        base_multiplier = self.atr_profit_multiplier  # 4.0
         
+        # Get recent volatility and trend information
         if len(df) < 20:
             return base_multiplier
         
         recent_vol = df['close'].iloc[-20:].pct_change().std()
         recent_trend = (df['close'].iloc[-1] - df['close'].iloc[-20]) / df['close'].iloc[-20]
         
-        if recent_vol < 0.01:
-            volatility_adjustment = 0.4
-        elif recent_vol > 0.03:
-            volatility_adjustment = -0.3
+        # Adjust multiplier based on volatility
+        if recent_vol < 0.01:  # Low volatility
+            volatility_adjustment = 0.4  # Increase profit target even more aggressively
+        elif recent_vol > 0.03:  # High volatility
+            volatility_adjustment = -0.3  # Decrease profit target less aggressively
         else:
             volatility_adjustment = 0.0
         
-        if abs(recent_trend) > 0.05:
-            trend_adjustment = 0.5
-        elif abs(recent_trend) < 0.01:
-            trend_adjustment = -0.2
+        # Adjust multiplier based on trend strength
+        if abs(recent_trend) > 0.05:  # Strong trend
+            trend_adjustment = 0.5  # Increase profit target even more aggressively
+        elif abs(recent_trend) < 0.01:  # Weak trend
+            trend_adjustment = -0.2  # Decrease profit target less aggressively
         else:
             trend_adjustment = 0.0
         
+        # Calculate dynamic multiplier
         dynamic_multiplier = base_multiplier + volatility_adjustment + trend_adjustment
+        
+        # Constrain to [2.5, 3.5] range for more consistent profit targets
         return max(2.5, min(3.5, dynamic_multiplier))
     
     def calculate_simple_position_size(self, signal_strength: float, confidence: float) -> float:
@@ -1044,6 +234,7 @@ class LeveragedBacktestEngine:
         Calculate position size without requiring trade history (for CSV processing).
         Uses the same logic as the original position sizing but without Kelly fraction.
         """
+        # Use base position sizing logic
         base_fraction = self.base_position_size
         quality_multiplier = (abs(signal_strength) * confidence)
         
@@ -1059,6 +250,7 @@ class LeveragedBacktestEngine:
     def calculate_atr_stop_levels(self, df: pd.DataFrame, entry_price: float, is_long: bool) -> Dict[str, float]:
         """Calculate ATR-based stop levels."""
         if not self.use_atr_stops:
+            # Use fixed percentage stops
             if is_long:
                 stop_loss = entry_price * (1 - self.stop_loss_pct)
                 profit_target = entry_price * (1 + self.profit_target_pct)
@@ -1072,10 +264,14 @@ class LeveragedBacktestEngine:
                 'trailing_stop': self.trailing_stop_pct
             }
         
+        # Calculate ATR
         atr = calculate_atr(df['high'], df['low'], df['close'], self.atr_period)
-        current_atr = atr.iloc[-1] if not atr.empty else entry_price * 0.01
+        current_atr = atr.iloc[-1] if not atr.empty else entry_price * 0.01  # Fallback to 1%
         
+        # Calculate ATR-based levels
         atr_stop_distance = current_atr * self.atr_multiplier
+        
+        # Use dynamic profit multiplier
         dynamic_profit_multiplier = self.calculate_dynamic_profit_multiplier(df, current_atr)
         
         if is_long:
@@ -1085,6 +281,7 @@ class LeveragedBacktestEngine:
             stop_loss = entry_price + atr_stop_distance
             profit_target = entry_price - (atr_stop_distance * dynamic_profit_multiplier)
         
+        # Convert ATR distance to percentage for trailing stop
         atr_trailing_pct = atr_stop_distance / entry_price
         
         return {
@@ -1098,6 +295,7 @@ class LeveragedBacktestEngine:
     def calculate_kelly_position_size(self, signal_strength: float, confidence: float) -> float:
         """Calculate position size using Kelly fraction based on past performance."""
         if not self.use_kelly_sizing:
+            # Use original position sizing logic
             base_fraction = self.base_position_size
             quality_multiplier = (abs(signal_strength) * confidence)
             if quality_multiplier > 0.8:
@@ -1109,23 +307,35 @@ class LeveragedBacktestEngine:
             else:
                 return base_fraction * 0.8
         
+        # Get recent trade returns for Kelly calculation
         recent_returns = []
         if len(self.trades) > 0:
+            # Get returns from recent trades (up to kelly_lookback)
             recent_trades = self.trades[-self.kelly_lookback:]
             for trade in recent_trades:
                 if 'return_pct' in trade:
                     recent_returns.append(trade['return_pct'])
         
+        # Calculate Kelly fraction
         kelly_fraction = calculate_kelly_fraction(recent_returns)
         
-        kelly_range = 0.5 - 0.05
-        position_range = self.max_position_size - self.base_position_size
+        # FIXED: Use Kelly fraction to scale between base and max position sizes
+        # Kelly fraction of 0.25 (default) = base position
+        # Kelly fraction of 0.5 (max) = max position
+        # This ensures we get the intended 5.0-10.0% positions (50-100% exposure)
         
-        kelly_scaled = (kelly_fraction - 0.05) / kelly_range
-        kelly_scaled = max(0.0, min(1.0, kelly_scaled))
+        # Map Kelly fraction (0.05-0.5) to position size range (base to max)
+        kelly_range = 0.5 - 0.05  # 0.45 range
+        position_range = self.max_position_size - self.base_position_size  # 0.05 range (10.0% - 5.0%)
         
+        # Scale Kelly fraction to position size
+        kelly_scaled = (kelly_fraction - 0.05) / kelly_range  # 0 to 1
+        kelly_scaled = max(0.0, min(1.0, kelly_scaled))  # Clamp to 0-1
+        
+        # Calculate position size: base + (scaled_kelly * range)
         kelly_adjusted_base = self.base_position_size + (kelly_scaled * position_range)
         
+        # Apply signal quality multiplier
         quality_multiplier = (abs(signal_strength) * confidence)
         if quality_multiplier > 0.8:
             position_fraction = min(self.max_position_size, kelly_adjusted_base * 1.2)
@@ -1136,6 +346,7 @@ class LeveragedBacktestEngine:
         else:
             position_fraction = kelly_adjusted_base * 0.9
         
+        # Ensure position size is within bounds (minimum 1% for proper allocation)
         position_fraction = max(0.01, min(self.max_position_size, position_fraction))
         
         return position_fraction
@@ -1145,46 +356,60 @@ class LeveragedBacktestEngine:
         if not self.use_volatility_filter:
             return True
         
+        # Check liquidity hours (avoid low liquidity periods)
         try:
+            # Extract hour from timestamp
             if ' ' in timestamp:
-                time_part = timestamp.split(' ')[0]
+                time_part = timestamp.split(' ')[0]  # Get time part (HH:MM)
                 hour = int(time_part.split(':')[0])
             else:
-                hour = 12
+                # If timestamp format is different, skip hour check
+                hour = 12  # Default to midday
             
             if hour in self.min_liquidity_hours:
-                return False
+                return False  # Don't trade during low liquidity hours
         except (ValueError, IndexError):
+            # If timestamp parsing fails, continue with volatility check
             pass
         
-        if current_idx < 20:
-            return True
+        # Need minimum data for volatility analysis
+        if current_idx < 20:  # Reduced from 50 to 20 for faster processing
+            return True  # Allow trading if not enough data
         
+        # 1. Primary volatility check (20-period) - most important filter
         recent_prices = df['close'].iloc[current_idx-19:current_idx+1]
         price_changes = recent_prices.pct_change().dropna()
         current_volatility = price_changes.std()
         
+        # Don't trade if volatility is too high (primary filter)
         if current_volatility > self.volatility_threshold:
             return False
         
+        # 2. Price range analysis (quick check)
         recent_high = df['high'].iloc[current_idx-4:current_idx+1].max()
         recent_low = df['low'].iloc[current_idx-4:current_idx+1].min()
         price_range_pct = (recent_high - recent_low) / recent_low
         
-        if price_range_pct > (self.volatility_threshold * 3.0):
+        # Don't trade if price range is too large (relaxed threshold)
+        if price_range_pct > (self.volatility_threshold * 3.0):  # Increased from 2.0 to 3.0 for more opportunities
             return False
         
+        # 3. ATR-based volatility filter (if available, use pre-calculated) - relaxed
         if 'atr_pct' in df.columns and current_idx > 0:
             current_atr_pct = df['atr_pct'].iloc[current_idx]
+            # Don't trade if ATR is in extreme territory (>5% for crypto) - relaxed from 3%
             if current_atr_pct > 0.05:
                 return False
         
-        if current_idx >= 50 and current_idx % 10 == 0:
+        # 4. Optional: Volatility trend check (only if enough data and not too expensive) - relaxed
+        if current_idx >= 50 and current_idx % 10 == 0:  # Check every 10th iteration (reduced frequency)
+            # Compare recent 20-period volatility with previous 20-period
             recent_20_vol = current_volatility
             previous_20_vol = df['close'].iloc[current_idx-39:current_idx-19].pct_change().std()
             
             if previous_20_vol > 0:
                 volatility_trend = recent_20_vol / previous_20_vol
+                # Don't trade if volatility is increasing rapidly (>100% increase) - relaxed from 60%
                 if volatility_trend > 2.0:
                     return False
         
@@ -1222,98 +447,40 @@ class LeveragedBacktestEngine:
         # Check if daily stop-loss exceeded
         return self.daily_loss >= self.daily_stop_loss
     
-    def check_cross_asset_confirmation(self, row: pd.Series, signal_direction: int) -> bool:
-        """Check if at least minimum number of cross-asset tokens confirm the signal."""
-        confirmations = 0
-        
-        # Get correlation columns for cross-asset analysis
-        corr_columns = [col for col in row.index if col.startswith('corr_return_1_vs_') and col.endswith('USDT')]
-        residual_columns = [col for col in row.index if col.startswith('residual_return_1_vs_') and col.endswith('USDT')]
-        
-        # Track cross-asset analysis for debugging (optional)
-        if hasattr(self, '_cross_asset_debug_count'):
-            self._cross_asset_debug_count += 1
-        else:
-            self._cross_asset_debug_count = 0
-            
-        if self._cross_asset_debug_count < 3:  # Log first 3 checks for debugging
-            print(f"    Cross-Asset Debug: signal_direction={signal_direction}, min_confirmations={self.min_cross_asset_confirmations}")
-            print(f"    Found {len(corr_columns)} correlation columns, {len(residual_columns)} residual columns")
-        
-        # Check correlation confirmations
-        corr_confirmations = 0
-        for col in corr_columns:
-            corr_value = row.get(col, 0)
-            if not pd.isna(corr_value):
-                # For long signals, look for positive correlation
-                # For short signals, look for negative correlation
-                if signal_direction == 1 and corr_value > 0.3:  # Positive correlation for longs
-                    confirmations += 1
-                    corr_confirmations += 1
-                elif signal_direction == -1 and corr_value < -0.3:  # Negative correlation for shorts
-                    confirmations += 1
-                    corr_confirmations += 1
-        
-        # Check cointegration confirmations (residual > 1.5σ)
-        residual_confirmations = 0
-        for col in residual_columns:
-            residual_value = row.get(col, 0)
-            if not pd.isna(residual_value):
-                if abs(residual_value) > self.cointegration_threshold:
-                    if signal_direction == 1 and residual_value < -self.cointegration_threshold:
-                        confirmations += 1
-                        residual_confirmations += 1
-                    elif signal_direction == -1 and residual_value > self.cointegration_threshold:
-                        confirmations += 1
-                        residual_confirmations += 1
-        
-        if self._cross_asset_debug_count < 3:
-            print(f"    Confirmations: total={confirmations}, corr={corr_confirmations}, residual={residual_confirmations}")
-            if confirmations < self.min_cross_asset_confirmations:
-                print(f"    REJECTED: Insufficient confirmations ({confirmations} < {self.min_cross_asset_confirmations})")
-            else:
-                print(f"    PASSED: Sufficient confirmations ({confirmations} >= {self.min_cross_asset_confirmations})")
-        
-        return confirmations >= self.min_cross_asset_confirmations
     
     def check_volatility_regime_filter(self, row: pd.Series) -> bool:
         """Check if current volatility regime is suitable for trading."""
         if not self.use_volatility_regime_filter:
             return True
         
-        atr_pct = row.get('atr_pct', 0)
-        rolling_vol = row.get('rolling_vol_15m', 0)
+        # Get log return and volume zscore from the row for volatility assessment
+        log_return = row.get('log_return_current', 0)
+        volume_zscore = row.get('volume_zscore_current', 0)
         
-        if pd.isna(atr_pct):
-            atr_pct = 0
-        if pd.isna(rolling_vol):
-            rolling_vol = 0
-        
+        # DEBUG: Log filter values (only for first few iterations to avoid spam)
         if hasattr(self, '_debug_count'):
             self._debug_count += 1
         else:
             self._debug_count = 0
             
-        if self._debug_count < 5:
-            print(f"    Volatility Filter Debug: atr_pct={atr_pct:.4f}, rolling_vol={rolling_vol:.4f}")
-            print(f"    Thresholds: atr_max={self.max_atr_threshold:.4f}, vol_min=0.001, vol_max=0.05")
+        if self._debug_count < 5:  # Log first 5 checks
+            print(f"    🔍 Volatility Filter Debug: log_return={log_return:.4f}, volume_zscore={volume_zscore:.4f}")
+            print(f"    🔍 Thresholds: log_return_max=0.05, volume_zscore_max=3.0")
         
-        if atr_pct > self.max_atr_threshold:
+        # Skip trades if log return is too extreme (noisy conditions)
+        if abs(log_return) > 0.05:  # Skip if log return > 5% (too volatile)
             if self._debug_count < 5:
-                print(f"    REJECTED: ATR too high ({atr_pct:.4f} > {self.max_atr_threshold:.4f})")
+                print(f"    ❌ REJECTED: Log return too extreme ({log_return:.4f} > 0.05)")
             return False
         
-        if rolling_vol <= 0.0000:
+        # Check volume zscore - must be reasonable for crypto
+        if abs(volume_zscore) > 3.0:  # Skip if volume is too extreme (3+ standard deviations)
             if self._debug_count < 5:
-                print(f"    REJECTED: Rolling vol too low ({rolling_vol:.4f} <= 0.001)")
-            return False
-        if rolling_vol >= 0.05:
-            if self._debug_count < 5:
-                print(f"    REJECTED: Rolling vol too high ({rolling_vol:.4f} >= 0.05)")
+                print(f"    ❌ REJECTED: Volume zscore too extreme ({volume_zscore:.4f} > 3.0)")
             return False
         
         if self._debug_count < 5:
-            print(f"    PASSED: Volatility regime filter")
+            print(f"    ✅ PASSED: Volatility regime filter")
         return True
     
     def force_liquidate_positions(self, timestamp: str, reason: str = 'MARGIN_CALL') -> List[Dict[str, Any]]:
@@ -1322,7 +489,8 @@ class LeveragedBacktestEngine:
         
         for symbol in list(self.positions.keys()):
             position = self.positions[symbol]
-            current_price = position['entry_price']
+            # Use current market price (simplified - in reality would need current price)
+            current_price = position['entry_price']  # Simplified for demo
             
             exit_trade = self._execute_exit(symbol, current_price, timestamp, reason, 0, 0)
             if exit_trade:
@@ -1334,233 +502,178 @@ class LeveragedBacktestEngine:
     
     def generate_leveraged_signal(self, row: pd.Series, symbol: str = '') -> Dict[str, Any]:
         """Generate high-quality signal optimized for leveraged trading with cross-asset analysis."""
+        # Get target values (now calculated directly in backtest_symbol)
         target_direction = row.get('target_direction', 0)
         target_return = row.get('target_return_1', 0)
         
+        # Handle case where target values might be NaN (end of dataset)
         if pd.isna(target_direction):
             target_direction = 0
         if pd.isna(target_return):
             target_return = 0
         
-        rsi_14 = row.get('rsi_14', 50)
-        ma_slope_5 = row.get('ma_slope_5', 0)
-        volume_ratio = row.get('volume_ratio', 1)
-        rolling_vol_15m = row.get('rolling_vol_15m', 0)
-        atr_pct = row.get('atr_pct', 0)
+        # Technical indicators (using current values from parquet file)
+        rsi_14 = row.get('rsi_14_current', 50)  # RSI 14
+        sma_20 = row.get('sma_20_current', 0)
+        sma_100 = row.get('sma_100_current', 0)
+        volume_zscore = row.get('volume_zscore_current', 0)
+        log_return = row.get('log_return_current', 0)
         
-        if pd.isna(rsi_14):
-            rsi_14 = 50
-        if pd.isna(ma_slope_5):
-            ma_slope_5 = 0
-        if pd.isna(volume_ratio) or volume_ratio <= 0:
-            volume_ratio = 1
-        if pd.isna(rolling_vol_15m):
-            rolling_vol_15m = 0
-        if pd.isna(atr_pct):
-            atr_pct = 0
+        # Calculate MA slope from SMA 20 and SMA 100
+        ma_slope_20 = (sma_20 - sma_100) / sma_100 if sma_100 != 0 else 0
         
-        current_idx = row.name if hasattr(row, 'name') else 0
         
-        correlations = self.calculate_cross_asset_correlations(symbol, current_idx)
-        residuals = self.calculate_cross_asset_residuals(symbol, current_idx)
-        
-        row_with_cross_asset = row.copy()
-        for key, value in correlations.items():
-            row_with_cross_asset[key] = value
-        for key, value in residuals.items():
-            row_with_cross_asset[key] = value
-        
-        cross_asset_signals = calculate_cross_asset_signal_strength(row_with_cross_asset, symbol)
-        correlation_strength = cross_asset_signals['correlation_strength']
-        cointegration_strength = cross_asset_signals['cointegration_strength']
-        cross_asset_confidence = cross_asset_signals['cross_asset_confidence']
-        
+        # Initialize signal components
         signal_strength = 0.0
         confidence = 0.0
         
+        # Enhanced signal generation for leveraged trading
         if target_direction == 1 and target_return > self.min_target_return:
             signal_strength = 0.5
             confidence = 0.4
             
-            if rsi_14 < 25:
+            # RSI confirmation (more conservative for leverage)
+            if rsi_14 < 25:  # Extreme oversold
                 signal_strength += 0.4
                 confidence += 0.3
-            elif rsi_14 < 30:
+            elif rsi_14 < 30:  # Very oversold
                 signal_strength += 0.3
                 confidence += 0.25
-            elif rsi_14 < 35:
+            elif rsi_14 < 35:  # Oversold
                 signal_strength += 0.2
                 confidence += 0.15
-            elif rsi_14 > 70:
+            elif rsi_14 > 70:  # Overbought - strong penalty for leverage
                 signal_strength -= 0.3
                 confidence -= 0.2
             
-            if ma_slope_5 > 0.003:
+            # Strong trend confirmation using SMA 20 vs SMA 100
+            if ma_slope_20 > 0.05:  # Very strong uptrend (SMA 20 > 5% above SMA 100)
                 signal_strength += 0.3
                 confidence += 0.25
-            elif ma_slope_5 > 0.0015:
+            elif ma_slope_20 > 0.02:  # Strong uptrend (SMA 20 > 2% above SMA 100)
                 signal_strength += 0.25
                 confidence += 0.2
-            elif ma_slope_5 > 0.0008:
+            elif ma_slope_20 > 0.01:  # Moderate uptrend (SMA 20 > 1% above SMA 100)
                 signal_strength += 0.15
                 confidence += 0.1
-            elif ma_slope_5 < -0.0008:
+            elif ma_slope_20 < -0.01:  # Downtrend - penalty (SMA 20 < 1% below SMA 100)
                 signal_strength -= 0.25
                 confidence -= 0.15
             
-            if volume_ratio > 2.5:
+            # Volume surge confirmation using volume zscore
+            if volume_zscore > 2.5:  # Extreme volume (2.5+ standard deviations)
                 signal_strength += 0.25
                 confidence += 0.2
-            elif volume_ratio > 1.8:
+            elif volume_zscore > 1.5:  # High volume (1.5+ standard deviations)
                 signal_strength += 0.2
                 confidence += 0.15
-            elif volume_ratio > 1.3:
+            elif volume_zscore > 0.5:  # Moderate volume (0.5+ standard deviations)
                 signal_strength += 0.1
                 confidence += 0.1
-            elif volume_ratio < 0.8:
+            elif volume_zscore < -0.5:  # Low volume - penalty (below average)
                 signal_strength -= 0.2
                 confidence -= 0.15
             
-            if 0.01 < rolling_vol_15m < 0.02:
+            # Log return analysis for momentum confirmation
+            if log_return > 0.02:  # Strong positive momentum (2%+ log return)
                 signal_strength += 0.2
                 confidence += 0.15
-            elif rolling_vol_15m > 0.03:
-                signal_strength -= 0.4
-                confidence -= 0.3
-            
-            if 0.015 < atr_pct < 0.025:
+            elif log_return > 0.01:  # Moderate positive momentum (1%+ log return)
                 signal_strength += 0.15
                 confidence += 0.1
-            elif atr_pct > 0.035:
+            elif log_return > 0.005:  # Weak positive momentum (0.5%+ log return)
+                signal_strength += 0.1
+                confidence += 0.05
+            elif log_return < -0.01:  # Negative momentum - penalty
                 signal_strength -= 0.3
                 confidence -= 0.2
             
-            if correlation_strength > 0.7:
-                signal_strength += 0.2
-                confidence += 0.15
-            elif correlation_strength > 0.5:
-                signal_strength += 0.1
-                confidence += 0.1
-            elif correlation_strength < 0.2:
-                signal_strength += 0.15
-                confidence += 0.1
-            
-            if cointegration_strength > 0.7:
-                signal_strength += 0.25
-                confidence += 0.2
-            elif cointegration_strength > 0.5:
-                signal_strength += 0.15
-                confidence += 0.1
-            
-            if cross_asset_confidence > 0.6:
-                confidence += 0.15
                 
         elif target_direction == 0 and target_return < -self.min_target_return:
             signal_strength = -0.5
             confidence = 0.4
             
-            if rsi_14 > 75:
+            # RSI confirmation for shorts (more conservative)
+            if rsi_14 > 75:  # Extreme overbought
                 signal_strength -= 0.4
                 confidence += 0.3
-            elif rsi_14 > 70:
+            elif rsi_14 > 70:  # Very overbought
                 signal_strength -= 0.3
                 confidence += 0.25
-            elif rsi_14 > 65:
+            elif rsi_14 > 65:  # Overbought
                 signal_strength -= 0.2
                 confidence += 0.15
-            elif rsi_14 < 30:
+            elif rsi_14 < 30:  # Oversold - penalty for shorts
                 signal_strength += 0.3
                 confidence -= 0.2
             
-            if ma_slope_5 < -0.003:
+            # Strong downtrend confirmation using SMA 20 vs SMA 100
+            if ma_slope_20 < -0.05:  # Very strong downtrend (SMA 20 < 5% below SMA 100)
                 signal_strength -= 0.3
                 confidence += 0.25
-            elif ma_slope_5 < -0.0015:
+            elif ma_slope_20 < -0.02:  # Strong downtrend (SMA 20 < 2% below SMA 100)
                 signal_strength -= 0.25
                 confidence += 0.2
-            elif ma_slope_5 < -0.0008:
+            elif ma_slope_20 < -0.01:  # Moderate downtrend (SMA 20 < 1% below SMA 100)
                 signal_strength -= 0.15
                 confidence += 0.1
-            elif ma_slope_5 > 0.0008:
+            elif ma_slope_20 > 0.01:  # Uptrend - penalty for shorts (SMA 20 > 1% above SMA 100)
                 signal_strength += 0.25
                 confidence -= 0.15
             
-            if volume_ratio > 2.5:
+            # Volume confirmation for shorts using volume zscore
+            if volume_zscore > 2.5:  # Extreme volume (2.5+ standard deviations)
                 signal_strength -= 0.25
                 confidence += 0.2
-            elif volume_ratio > 1.8:
+            elif volume_zscore > 1.5:  # High volume (1.5+ standard deviations)
                 signal_strength -= 0.2
                 confidence += 0.15
-            elif volume_ratio > 1.3:
+            elif volume_zscore > 0.5:  # Moderate volume (0.5+ standard deviations)
                 signal_strength -= 0.1
                 confidence += 0.1
-            elif volume_ratio < 0.8:
+            elif volume_zscore < -0.5:  # Low volume - penalty (below average)
                 signal_strength += 0.2
                 confidence -= 0.15
             
-            if 0.01 < rolling_vol_15m < 0.02:
+            # Log return analysis for shorts momentum
+            if log_return < -0.02:  # Strong negative momentum (2%+ negative log return)
                 signal_strength -= 0.2
                 confidence += 0.15
-            elif rolling_vol_15m > 0.03:
-                signal_strength += 0.4
-                confidence -= 0.3
-            
-            if correlation_strength > 0.7:
-                signal_strength -= 0.2
-                confidence += 0.15
-            elif correlation_strength > 0.5:
+            elif log_return < -0.01:  # Moderate negative momentum (1%+ negative log return)
+                signal_strength -= 0.15
+                confidence += 0.1
+            elif log_return < -0.005:  # Weak negative momentum (0.5%+ negative log return)
                 signal_strength -= 0.1
-                confidence += 0.1
-            elif correlation_strength < 0.2:
-                signal_strength -= 0.15
-                confidence += 0.1
+                confidence += 0.05
+            elif log_return > 0.01:  # Positive momentum - penalty for shorts
+                signal_strength += 0.3
+                confidence -= 0.2
             
-            if cointegration_strength > 0.7:
-                signal_strength -= 0.25
-                confidence += 0.2
-            elif cointegration_strength > 0.5:
-                signal_strength -= 0.15
-                confidence += 0.1
-            
-            if cross_asset_confidence > 0.6:
-                confidence += 0.15
         
+        # Normalize and apply quality filters
         signal_strength = np.clip(signal_strength, -1.0, 1.0)
         confidence = np.clip(confidence, 0.0, 1.0)
         
+        # Determine final signal with very high thresholds for leverage
         if abs(signal_strength) >= self.min_signal_strength and confidence >= self.min_confidence:
-            signal_direction = 1 if signal_strength > 0 else -1
-            if self.check_cross_asset_confirmation(row_with_cross_asset, signal_direction):
-                signal = 'BUY' if signal_strength > 0 else 'SELL'
-            else:
-                signal = 'HOLD'
-                signal_strength = 0.0
-        elif abs(signal_strength) >= 0.2 and confidence >= 0.2:
+            signal = 'BUY' if signal_strength > 0 else 'SELL'
+        elif abs(signal_strength) >= 0.2 and confidence >= 0.2:  # Very relaxed weak signal thresholds
             signal = 'WEAK_BUY' if signal_strength > 0 else 'WEAK_SELL'
         else:
             signal = 'HOLD'
             signal_strength = 0.0
         
-        if signal in ['BUY', 'SELL']:
-            position_size = self.base_position_size * (1 + signal_strength * confidence)
-            position_size = min(position_size, self.max_position_size)
-        else:
-            position_size = 0.0
-        
         return {
             'signal': signal,
             'signal_strength': signal_strength,
             'confidence': confidence,
-            'position_size': position_size,
             'target_return': target_return,
             'rsi_14': rsi_14,
-            'ma_slope_5': ma_slope_5,
-            'volume_ratio': volume_ratio,
-            'rolling_vol_15m': rolling_vol_15m,
-            'atr_pct': atr_pct,
-            'correlation_strength': correlation_strength,
-            'cointegration_strength': cointegration_strength,
-            'cross_asset_confidence': cross_asset_confidence
+            'sma_20': sma_20,
+            'sma_100': sma_100,
+            'ma_slope_20': ma_slope_20,
+            'volume_zscore': volume_zscore,
+            'log_return': log_return
         }
 
     def generate_exit_signal(self, row: pd.Series, symbol: str, current_position: Dict) -> Dict[str, Any]:
@@ -1610,12 +723,14 @@ class LeveragedBacktestEngine:
                 exit_confidence = 0.2
         
         # Additional trend reversal detection using technical indicators
-        rsi_14 = row.get('rsi', 50)
-        ma_slope_5 = row.get('ma_slope', 0)
+        rsi_14 = row.get('rsi_14_current', 50)
+        sma_20 = row.get('sma_20_current', 0)
+        sma_100 = row.get('sma_100_current', 0)
+        ma_slope_20 = (sma_20 - sma_100) / sma_100 if sma_100 != 0 else 0
         
         if is_long_position:
             # For long positions, check for bearish reversal signals
-            if rsi_14 > 70 and ma_slope_5 < -0.001:  # Overbought + declining MA
+            if rsi_14 > 70 and ma_slope_20 < -0.01:  # Overbought + declining MA (SMA 20 below SMA 100)
                 if exit_signal == 'HOLD':
                     exit_signal = 'SELL'
                     exit_strength = 0.4
@@ -1626,7 +741,7 @@ class LeveragedBacktestEngine:
                     exit_confidence = max(exit_confidence, 0.3)
         else:
             # For short positions, check for bullish reversal signals
-            if rsi_14 < 30 and ma_slope_5 > 0.001:  # Oversold + rising MA
+            if rsi_14 < 30 and ma_slope_20 > 0.01:  # Oversold + rising MA (SMA 20 above SMA 100)
                 if exit_signal == 'HOLD':
                     exit_signal = 'BUY'
                     exit_strength = 0.4
@@ -1644,7 +759,9 @@ class LeveragedBacktestEngine:
             'current_signal_strength': current_signal_strength,
             'current_confidence': current_confidence,
             'rsi_14': rsi_14,
-            'ma_slope_5': ma_slope_5
+            'sma_20': sma_20,
+            'sma_100': sma_100,
+            'ma_slope_20': ma_slope_20
         }
     
     def manage_leveraged_position(self, symbol: str, current_price: float, 
@@ -1839,14 +956,14 @@ class LeveragedBacktestEngine:
         Returns:
             Path to the updated CSV file
         """
-        print(f"Adding signal columns to {symbol} CSV...")
+        print(f"📊 Adding signal columns to {symbol} CSV...")
         
         # Read the CSV file
         try:
             df = pd.read_csv(csv_file_path, low_memory=False)
             print(f"   Loaded {len(df)} rows from {csv_file_path}")
         except Exception as e:
-            print(f"   Error reading CSV: {e}")
+            print(f"   ❌ Error reading CSV: {e}")
             return csv_file_path
         
         # Initialize new columns
@@ -1898,13 +1015,13 @@ class LeveragedBacktestEngine:
         # Save the updated CSV
         try:
             df.to_csv(output_path, index=False)
-            print(f"   Updated CSV saved to: {output_path}")
-            print(f"   Generated {signals_generated} signals out of {len(df)} rows")
-            print(f"   Calculated {positions_calculated} position sizes")
+            print(f"   ✅ Updated CSV saved to: {output_path}")
+            print(f"   📈 Generated {signals_generated} signals out of {len(df)} rows")
+            print(f"   💰 Calculated {positions_calculated} position sizes")
             
             # Print signal distribution
             signal_counts = df['target_signal'].value_counts()
-            print(f"   Signal distribution:")
+            print(f"   📊 Signal distribution:")
             for signal, count in signal_counts.items():
                 percentage = (count / len(df)) * 100
                 print(f"      {signal}: {count} ({percentage:.1f}%)")
@@ -1912,7 +1029,7 @@ class LeveragedBacktestEngine:
             return output_path
             
         except Exception as e:
-            print(f"   Error saving CSV: {e}")
+            print(f"   ❌ Error saving CSV: {e}")
             return csv_file_path
 
     def add_signal_columns_to_all_csvs(self, data_dir: str = 'features_with_residuals') -> Dict[str, str]:
@@ -1925,20 +1042,20 @@ class LeveragedBacktestEngine:
         Returns:
             Dictionary mapping original file paths to updated file paths
         """
-        print(f"Adding signal columns to all CSV files in {data_dir}...")
+        print(f"🚀 Adding signal columns to all CSV files in {data_dir}...")
         
         if not os.path.exists(data_dir):
-            print(f"   Directory {data_dir} does not exist")
+            print(f"   ❌ Directory {data_dir} does not exist")
             return {}
         
         # Find all CSV files
         csv_files = [f for f in os.listdir(data_dir) if f.endswith('.csv') and 'features_with_residuals' in f]
         
         if not csv_files:
-            print(f"   No CSV files found in {data_dir}")
+            print(f"   ❌ No CSV files found in {data_dir}")
             return {}
         
-        print(f"   Found {len(csv_files)} CSV files to process")
+        print(f"   📁 Found {len(csv_files)} CSV files to process")
         
         updated_files = {}
         
@@ -1949,107 +1066,34 @@ class LeveragedBacktestEngine:
             # Full path to the CSV file
             csv_path = os.path.join(data_dir, csv_file)
             
-            print(f"\nProcessing {symbol}...")
+            print(f"\n📊 Processing {symbol}...")
             
             # Add signal columns
             updated_path = self.add_signal_columns_to_csv(csv_path, symbol)
             updated_files[csv_path] = updated_path
         
-        print(f"\nSuccessfully processed {len(updated_files)} CSV files")
+        print(f"\n✅ Successfully processed {len(updated_files)} CSV files")
         return updated_files
     
-    def calculate_technical_indicators(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate all technical indicators directly from OHLCV data."""
-        print("  Calculating technical indicators from OHLCV data...")
+    def calculate_target_features(self, df: pd.DataFrame) -> pd.DataFrame:
+        """Calculate target features directly from OHLCV data to avoid dependency on pre-calculated target columns."""
+        print("  🎯 Calculating target features directly from OHLCV data...")
         
         # Validate required columns
-        required_cols = ['open', 'high', 'low', 'close', 'volume']
-        missing_cols = [col for col in required_cols if col not in df.columns]
-        if missing_cols:
-            raise ValueError(f"Missing required columns: {missing_cols}")
+        if 'close' not in df.columns:
+            raise ValueError("Missing 'close' column required for target calculation")
         
-        # 1. Calculate base returns
+        # Calculate base returns
         df['return_1'] = df['close'].pct_change(1)
         df['return_5'] = df['close'].pct_change(5)
         df['return_15'] = df['close'].pct_change(15)
+        
+        # Calculate log returns (handle division by zero)
         df['log_return'] = np.where(
             df['close'].shift(1) > 0,
             np.log(df['close'] / df['close'].shift(1)),
             0
         )
-        
-        # 2. Rolling Volatility
-        df['rolling_vol_20'] = df['return_1'].rolling(20).std()
-        df['rolling_vol_60'] = df['return_1'].rolling(60).std()
-        df['rolling_vol_15m'] = df['return_1'].rolling(15).std()  # Used in volatility filter
-        
-        # 3. ATR% (Average True Range normalized by price)
-        high_low = df['high'] - df['low']
-        high_close = np.abs(df['high'] - df['close'].shift(1))
-        low_close = np.abs(df['low'] - df['close'].shift(1))
-        
-        true_range = np.maximum(high_low, np.maximum(high_close, low_close))
-        df['atr'] = true_range.rolling(14).mean()
-        df['atr_pct'] = (df['atr'] / df['close']) * 100
-        
-        # 4. RSI (14)
-        delta = df['close'].diff()
-        gain = (delta.where(delta > 0, 0)).rolling(window=14).mean()
-        loss = (-delta.where(delta < 0, 0)).rolling(window=14).mean()
-        rs = gain / loss
-        df['rsi_14'] = 100 - (100 / (1 + rs))
-        
-        # 5. MA Slopes
-        df['ma_5'] = df['close'].rolling(5).mean()
-        df['ma_20'] = df['close'].rolling(20).mean()
-        df['ma_slope_5'] = df['ma_5'].diff() / 5
-        df['ma_slope_20'] = df['ma_20'].diff() / 20
-        
-        # 6. Candle Ratios
-        body_size = np.abs(df['close'] - df['open'])
-        upper_wick = df['high'] - np.maximum(df['open'], df['close'])
-        lower_wick = np.minimum(df['open'], df['close']) - df['low']
-        total_range = df['high'] - df['low']
-        
-        df['body_ratio'] = np.where(total_range > 0, body_size / total_range, 0)
-        df['upper_wick_ratio'] = np.where(total_range > 0, upper_wick / total_range, 0)
-        df['lower_wick_ratio'] = np.where(total_range > 0, lower_wick / total_range, 0)
-        
-        # 7. Volume Ratios
-        df['volume_ma_20'] = df['volume'].rolling(20).mean()
-        df['volume_ratio'] = df['volume'] / df['volume_ma_20']
-        
-        # 8. Rollups: 3 / 9 / 36 Bars (Rolling Summaries)
-        windows = [3, 9, 36]
-        
-        for window in windows:
-            # Rolling returns over each window
-            df[f'return_{window}'] = df['close'].pct_change(window)
-            
-            # Rolling volatility over each window
-            df[f'vol_{window}'] = df['return_1'].rolling(window).std()
-            
-            # MA trends over each window
-            df[f'ma_{window}'] = df['close'].rolling(window).mean()
-            df[f'ma_trend_{window}'] = df[f'ma_{window}'].diff() / window
-            
-            # Volume anomalies over each window
-            df[f'volume_ma_{window}'] = df['volume'].rolling(window).mean()
-            df[f'volume_anomaly_{window}'] = df['volume'] / df[f'volume_ma_{window}']
-            
-            # RSI over different horizons
-            delta = df['close'].diff()
-            gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-            loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
-            rs = gain / loss
-            df[f'rsi_{window}'] = 100 - (100 / (1 + rs))
-        
-        print("  Technical indicators calculated: RSI, ATR, MA slopes, volume ratios, rollups")
-        return df
-
-    def calculate_target_features(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Calculate target features directly from OHLCV data to avoid dependency on pre-calculated target columns."""
-        print("  Calculating target features directly from OHLCV data...")
         
         # Create target features (shifted forward by 1 bar to prevent lookahead bias)
         target_features = ['return_1', 'return_5', 'return_15', 'log_return']
@@ -2073,189 +1117,13 @@ class LeveragedBacktestEngine:
             if target_col in df.columns:
                 df[target_col] = df[target_col].fillna(0)
         
-        print(f"  Target features calculated: target_direction, target_return_1, target_return_5, target_return_15, target_log_return")
-        print(f"  Target direction distribution: {df['target_direction'].value_counts().to_dict()}")
+        print(f"  ✅ Target features calculated: target_direction, target_return_1, target_return_5, target_return_15, target_log_return")
+        print(f"  📊 Target direction distribution: {df['target_direction'].value_counts().to_dict()}")
         return df
-
-    def fill_technical_indicator_nans(self, df: pd.DataFrame) -> pd.DataFrame:
-        """Fill NaN values in technical indicators with appropriate defaults."""
-        print("  Filling NaN values in technical indicators...")
-        
-        # Fill NaN values with appropriate defaults
-        technical_indicators = {
-            'rsi_14': 50,  # Neutral RSI
-            'ma_slope_5': 0,
-            'ma_slope_20': 0,
-            'volume_ratio': 1,  # Neutral volume ratio
-            'rolling_vol_15m': 0,
-            'rolling_vol_20': 0,
-            'rolling_vol_60': 0,
-            'atr_pct': 0,
-            'body_ratio': 0,
-            'upper_wick_ratio': 0,
-            'lower_wick_ratio': 0
-        }
-        
-        for indicator, default_value in technical_indicators.items():
-            if indicator in df.columns:
-                df[indicator] = df[indicator].fillna(default_value)
-        
-        # Fill rollup indicators
-        for window in [3, 9, 36]:
-            for suffix in ['', '_trend']:
-                col = f'ma_{window}{suffix}'
-                if col in df.columns:
-                    df[col] = df[col].fillna(0)
-            
-            for suffix in ['', '_anomaly']:
-                col = f'volume_ma_{window}{suffix}'
-                if col in df.columns:
-                    df[col] = df[col].fillna(1 if 'anomaly' in col else 0)
-            
-            for col in [f'vol_{window}', f'rsi_{window}']:
-                if col in df.columns:
-                    df[col] = df[col].fillna(0)
-        
-        print("  Technical indicator NaN values filled")
-        return df
-
-    def load_cross_asset_data(self, data_dir: str = 'historical_data') -> None:
-        """Load OHLCV data for all assets to enable cross-asset correlation calculation."""
-        print("  Loading cross-asset data for correlation calculation...")
-        
-        files = [f for f in os.listdir(data_dir) if f.endswith('_historical_5m_12months.csv')]
-        symbols = [f.split('_')[0] for f in files]
-        
-        for symbol in symbols:
-            file_path = os.path.join(data_dir, f"{symbol}_historical_5m_12months.csv")
-            try:
-                df = pd.read_csv(file_path)
-                
-                # Get timestamp column
-                timestamp_col = self.get_timestamp_column(df)
-                df['timestamp'] = pd.to_datetime(df[timestamp_col])
-                df = df.sort_values('timestamp').reset_index(drop=True)
-                
-                # Calculate returns
-                df['return_1'] = df['close'].pct_change(1)
-                
-                # Store data
-                self.cross_asset_data[symbol] = df
-                self.cross_asset_returns[symbol] = df['return_1'].values
-                
-            except Exception as e:
-                print(f"    Warning: Could not load {symbol}: {e}")
-        
-        print(f"  Loaded cross-asset data for {len(self.cross_asset_data)} symbols")
-
-    def calculate_cross_asset_correlations(self, current_symbol: str, current_idx: int) -> Dict[str, float]:
-        """Calculate cross-asset correlations for the current symbol at the given index."""
-        correlations = {}
-        
-        if current_symbol not in self.cross_asset_returns:
-            return correlations
-        
-        # Get current symbol's returns for the lookback period
-        start_idx = max(0, current_idx - self.cross_asset_lookback)
-        end_idx = current_idx + 1
-        
-        current_returns = self.cross_asset_returns[current_symbol][start_idx:end_idx]
-        
-        # Calculate correlation with other assets
-        for symbol, returns in self.cross_asset_returns.items():
-            if symbol != current_symbol:
-                try:
-                    # Get corresponding returns for the other asset
-                    other_returns = returns[start_idx:end_idx]
-                    
-                    # Ensure both arrays have the same length and no NaN values
-                    min_len = min(len(current_returns), len(other_returns))
-                    if min_len < 10:  # Need at least 10 data points
-                        continue
-                    
-                    current_clean = current_returns[-min_len:]
-                    other_clean = other_returns[-min_len:]
-                    
-                    # Remove NaN values
-                    mask = ~(np.isnan(current_clean) | np.isnan(other_clean))
-                    if np.sum(mask) < 10:  # Need at least 10 valid data points
-                        continue
-                    
-                    current_clean = current_clean[mask]
-                    other_clean = other_clean[mask]
-                    
-                    # Calculate correlation
-                    if len(current_clean) > 1 and np.std(current_clean) > 0 and np.std(other_clean) > 0:
-                        correlation = np.corrcoef(current_clean, other_clean)[0, 1]
-                        if not np.isnan(correlation):
-                            correlations[f'corr_return_1_vs_{symbol}'] = correlation
-                            
-                except Exception as e:
-                    continue  # Skip this asset if calculation fails
-        
-        return correlations
-
-    def calculate_cross_asset_residuals(self, current_symbol: str, current_idx: int) -> Dict[str, float]:
-        """Calculate cross-asset cointegration residuals for the current symbol at the given index."""
-        residuals = {}
-        
-        if current_symbol not in self.cross_asset_returns:
-            return residuals
-        
-        # Get current symbol's returns for the lookback period
-        start_idx = max(0, current_idx - self.cross_asset_lookback)
-        end_idx = current_idx + 1
-        
-        current_returns = self.cross_asset_returns[current_symbol][start_idx:end_idx]
-        
-        # Calculate residuals with other assets
-        for symbol, returns in self.cross_asset_returns.items():
-            if symbol != current_symbol:
-                try:
-                    # Get corresponding returns for the other asset
-                    other_returns = returns[start_idx:end_idx]
-                    
-                    # Ensure both arrays have the same length
-                    min_len = min(len(current_returns), len(other_returns))
-                    if min_len < 20:  # Need at least 20 data points for cointegration
-                        continue
-                    
-                    current_clean = current_returns[-min_len:]
-                    other_clean = other_returns[-min_len:]
-                    
-                    # Remove NaN values
-                    mask = ~(np.isnan(current_clean) | np.isnan(other_clean))
-                    if np.sum(mask) < 20:  # Need at least 20 valid data points
-                        continue
-                    
-                    current_clean = current_clean[mask]
-                    other_clean = other_clean[mask]
-                    
-                    # Simple cointegration residual calculation
-                    # Use linear regression to find the relationship
-                    if len(current_clean) > 1 and np.std(other_clean) > 0:
-                        # Calculate beta (slope) using least squares
-                        beta = np.cov(current_clean, other_clean)[0, 1] / np.var(other_clean)
-                        
-                        # Calculate residual (current - beta * other)
-                        residual = current_clean[-1] - beta * other_clean[-1]
-                        
-                        # Normalize by standard deviation of residuals
-                        if len(current_clean) > 10:
-                            all_residuals = current_clean - beta * other_clean
-                            residual_std = np.std(all_residuals)
-                            if residual_std > 0:
-                                normalized_residual = residual / residual_std
-                                residuals[f'residual_return_1_vs_{symbol}'] = normalized_residual
-                                
-                except Exception as e:
-                    continue  # Skip this asset if calculation fails
-        
-        return residuals
 
     def backtest_symbol(self, df: pd.DataFrame, symbol: str) -> Dict[str, Any]:
         """Run leveraged backtest."""
-        print(f"Leveraged backtesting {symbol} (5x leverage)...")
+        print(f"🔄 Leveraged backtesting {symbol} (5x leverage)...")
         
         self.reset()
         
@@ -2265,27 +1133,18 @@ class LeveragedBacktestEngine:
         except ValueError as e:
             return {'error': str(e)}
         
-        # Only require basic OHLCV columns - we'll calculate everything ourselves
-        required_cols = [timestamp_col, 'open', 'high', 'low', 'close', 'volume']
-        missing_cols = [col for col in required_cols if col not in df.columns]
+        # Require basic OHLCV columns and technical indicators (using parquet column names)
+        required_cols = [timestamp_col, 'close', 'high', 'low', 'open', 'volume']
+        technical_cols = ['rsi_14_current', 'sma_20_current', 'sma_100_current', 'volume_zscore_current', 'log_return_current']
+        all_required_cols = required_cols + technical_cols
+        
+        missing_cols = [col for col in all_required_cols if col not in df.columns]
         if missing_cols:
             return {'error': f'Missing required columns: {missing_cols}'}
         
         df['timestamp'] = pd.to_datetime(df[timestamp_col])
         df = df.sort_values('timestamp').reset_index(drop=True)
-        
-        # Handle different timestamp formats
-        try:
-            df['formatted_timestamp'] = df['timestamp'].dt.strftime('%H:%M %Y/%m/%d')
-        except:
-            # Fallback for different date formats
-            df['formatted_timestamp'] = df['timestamp'].astype(str)
-        
-        # Calculate all technical indicators directly from OHLCV data
-        df = self.calculate_technical_indicators(df)
-        
-        # Fill NaN values in technical indicators
-        df = self.fill_technical_indicator_nans(df)
+        df['formatted_timestamp'] = df['timestamp'].dt.strftime('%H:%M %Y/%m/%d')
         
         # Calculate target features directly from OHLCV data
         df = self.calculate_target_features(df)
@@ -2323,7 +1182,7 @@ class LeveragedBacktestEngine:
                 self.trades.append(exit_trade)
                 continue
             
-            # Track filter rejections for analysis
+            # DEBUG: Track filter rejections
             debug_info = {
                 'timestamp': timestamp,
                 'symbol': symbol,
@@ -2335,21 +1194,21 @@ class LeveragedBacktestEngine:
             if not self.check_volatility_filter(df, idx, timestamp):
                 debug_info['rejected_by'].append('volatility_filter')
                 if idx % 10000 == 0:  # Log every 10k iterations
-                    print(f"  DEBUG {symbol} idx={idx}: Rejected by volatility_filter")
+                    print(f"  🔍 DEBUG {symbol} idx={idx}: Rejected by volatility_filter")
                 continue  # Skip trading during extreme noise or low liquidity
             
             # Check volatility regime filter before generating signal
             if not self.check_volatility_regime_filter(row):
                 debug_info['rejected_by'].append('volatility_regime_filter')
                 if idx % 10000 == 0:  # Log every 10k iterations
-                    print(f"  DEBUG {symbol} idx={idx}: Rejected by volatility_regime_filter")
+                    print(f"  🔍 DEBUG {symbol} idx={idx}: Rejected by volatility_regime_filter")
                 continue  # Skip trading during high volatility regimes
             
             # Check drawdown limit - halt trading if exceeded
             if self.check_drawdown_limit():
                 debug_info['rejected_by'].append('drawdown_limit')
                 if idx % 10000 == 0:  # Log every 10k iterations
-                    print(f"  DEBUG {symbol} idx={idx}: Rejected by drawdown_limit")
+                    print(f"  🔍 DEBUG {symbol} idx={idx}: Rejected by drawdown_limit")
                 self.trading_halted = True
                 continue  # Skip trading if drawdown limit exceeded
             
@@ -2358,22 +1217,22 @@ class LeveragedBacktestEngine:
             if self.check_daily_stop_loss(timestamp, current_portfolio_value):
                 debug_info['rejected_by'].append('daily_stop_loss')
                 if idx % 10000 == 0:  # Log every 10k iterations
-                    print(f"  DEBUG {symbol} idx={idx}: Rejected by daily_stop_loss")
+                    print(f"  🔍 DEBUG {symbol} idx={idx}: Rejected by daily_stop_loss")
                 self.trading_halted = True
                 continue  # Skip trading if daily stop-loss exceeded
             
             # Generate leveraged signal
             signal_data = self.generate_leveraged_signal(row, symbol)
             
-            # Log signal generation progress
+            # DEBUG: Check signal generation
             if idx % 10000 == 0:  # Log every 10k iterations
-                print(f"  DEBUG {symbol} idx={idx}: Signal={signal_data['signal']}, Strength={signal_data['signal_strength']:.3f}, Confidence={signal_data['confidence']:.3f}")
+                print(f"  🔍 DEBUG {symbol} idx={idx}: Signal={signal_data['signal']}, Strength={signal_data['signal_strength']:.3f}, Confidence={signal_data['confidence']:.3f}")
             
-            # Track signal rejections
+            # DEBUG: Track signal rejections
             if signal_data['signal'] == 'HOLD':
                 debug_info['rejected_by'].append('signal_generation')
                 if idx % 10000 == 0:  # Log every 10k iterations
-                    print(f"  DEBUG {symbol} idx={idx}: Rejected by signal_generation (HOLD)")
+                    print(f"  🔍 DEBUG {symbol} idx={idx}: Rejected by signal_generation (HOLD)")
             
             # Execute leveraged trade
             trade_info = self.execute_leveraged_trade(timestamp, symbol, signal_data, price, df)
@@ -2396,10 +1255,19 @@ class LeveragedBacktestEngine:
         
         # Calculate performance metrics
         sharpe_ratio = 0.0
+        sortino_ratio = 0.0
         if len(self.portfolio_values) > 1:
             returns = pd.Series(self.portfolio_values).pct_change().dropna()
-            if len(returns) > 0 and returns.std() > 0:
-                sharpe_ratio = returns.mean() / returns.std() * np.sqrt(252)
+            if len(returns) > 0:
+                if returns.std() > 0:
+                    sharpe_ratio = returns.mean() / returns.std() * np.sqrt(252)
+                
+                # Calculate Sortino ratio (downside deviation)
+                negative_returns = returns[returns < 0]
+                if len(negative_returns) > 0:
+                    downside_deviation = negative_returns.std() * np.sqrt(252)
+                    if downside_deviation > 0:
+                        sortino_ratio = returns.mean() * np.sqrt(252) / downside_deviation
         
         max_drawdown = 0.0
         if len(self.portfolio_values) > 0:
@@ -2408,6 +1276,42 @@ class LeveragedBacktestEngine:
             max_drawdown = np.min(drawdown)
         
         win_rate = self.winning_trades / self.total_trades if self.total_trades > 0 else 0
+        
+        # Calculate hit rate (approximate - percentage of profitable periods)
+        hit_rate = 0.0
+        if len(self.portfolio_values) > 1:
+            portfolio_returns = pd.Series(self.portfolio_values).pct_change().dropna()
+            profitable_periods = (portfolio_returns > 0).sum()
+            hit_rate = profitable_periods / len(portfolio_returns) if len(portfolio_returns) > 0 else 0
+        
+        # Calculate exposure (average position size as percentage of portfolio)
+        exposure = 0.0
+        if len(self.portfolio_values) > 0:
+            # Calculate average exposure from trade data
+            total_exposure = 0.0
+            exposure_periods = 0
+            for trade in self.trades:
+                if trade.get('action') == 'BUY' and 'margin_used' in trade:
+                    # Calculate exposure as margin used / capital at time of trade
+                    capital_at_trade = trade.get('capital_after', self.initial_capital) + trade.get('margin_used', 0)
+                    if capital_at_trade > 0:
+                        trade_exposure = trade['margin_used'] / capital_at_trade
+                        total_exposure += trade_exposure
+                        exposure_periods += 1
+            
+            exposure = total_exposure / exposure_periods if exposure_periods > 0 else 0
+        
+        # Calculate CVaR (Conditional Value at Risk) at 5% level
+        cvar_5 = 0.0
+        if len(self.portfolio_values) > 1:
+            portfolio_returns = pd.Series(self.portfolio_values).pct_change().dropna()
+            if len(portfolio_returns) > 0:
+                # Calculate 5% VaR (Value at Risk)
+                var_5 = np.percentile(portfolio_returns, 5)
+                # Calculate CVaR as mean of returns below 5% VaR
+                returns_below_var = portfolio_returns[portfolio_returns <= var_5]
+                if len(returns_below_var) > 0:
+                    cvar_5 = returns_below_var.mean()
         
         # Calculate average gain per trade (key metric)
         avg_gain_per_trade_pct = 0.0
@@ -2425,469 +1329,376 @@ class LeveragedBacktestEngine:
         avg_mfe = np.mean(mfe_values) if mfe_values else 0
         avg_mae = np.mean(mae_values) if mae_values else 0
         
-        # Calculate profit factor and related metrics
-        profit_factor_metrics = calculate_profit_factor(self.trades)
-        
         results = {
             'symbol': symbol,
             'total_return': total_return,
             'sharpe_ratio': sharpe_ratio,
+            'sortino_ratio': sortino_ratio,
             'max_drawdown': max_drawdown,
             'total_trades': self.total_trades,
             'winning_trades': self.winning_trades,
             'losing_trades': self.losing_trades,
             'win_rate': win_rate,
+            'hit_rate': hit_rate,
+            'exposure': exposure,
+            'cvar_5': cvar_5,
             'avg_gain_per_trade_pct': avg_gain_per_trade_pct,
             'avg_mfe': avg_mfe,
             'avg_mae': avg_mae,
             'margin_calls': self.margin_calls,
             'leverage': self.leverage,
-            'trades': self.trades.copy(),
-            # Profit factor metrics
-            'profit_factor': profit_factor_metrics['profit_factor'],
-            'gross_profit': profit_factor_metrics['gross_profit'],
-            'gross_loss': profit_factor_metrics['gross_loss'],
-            'total_profit_trades': profit_factor_metrics['total_profit_trades'],
-            'total_loss_trades': profit_factor_metrics['total_loss_trades'],
-            'largest_win': profit_factor_metrics['largest_win'],
-            'largest_loss': profit_factor_metrics['largest_loss'],
-            'avg_win': profit_factor_metrics['avg_win'],
-            'avg_loss': profit_factor_metrics['avg_loss'],
-            'win_loss_ratio': profit_factor_metrics['win_loss_ratio']
+            'trades': self.trades.copy()
         }
         
-        # Success criteria removed - no longer evaluating performance against thresholds
+        # Success criteria
+        success_criteria = {
+            'sharpe_ratio_ok': sharpe_ratio >= 1.2,
+            'avg_gain_ok': avg_gain_per_trade_pct >= 1.0,
+            'max_drawdown_ok': abs(max_drawdown) <= 0.015,
+            'mae_control_ok': avg_mae <= 0.01,
+            'overall_success': (sharpe_ratio >= 1.2 and avg_gain_per_trade_pct >= 1.0 and 
+                              abs(max_drawdown) <= 0.015 and avg_mae <= 0.01)
+        }
         
-        # Print comprehensive results summary
-        self._print_backtest_results(symbol, total_return, sharpe_ratio, max_drawdown, 
-                                   win_rate, avg_gain_per_trade_pct, avg_mfe, avg_mae, 
-                                   profit_factor_metrics)
+        print(f"  ✅ {symbol} leveraged backtest completed:")
+        print(f"    📊 Total Return: {total_return:.2%}")
+        print(f"    📈 Sharpe Ratio: {sharpe_ratio:.4f} {'✅' if success_criteria['sharpe_ratio_ok'] else '❌'}")
+        print(f"    📉 Sortino Ratio: {sortino_ratio:.4f}")
+        print(f"    📉 Max Drawdown: {max_drawdown:.2%} {'✅' if success_criteria['max_drawdown_ok'] else '❌'}")
+        print(f"    🎯 Total Trades: {self.total_trades}")
+        print(f"    🏆 Win Rate: {win_rate:.2%}")
+        print(f"    🎯 Hit Rate: {hit_rate:.2%}")
+        print(f"    💰 Avg Gain per Trade: {avg_gain_per_trade_pct:.4f}% {'✅' if success_criteria['avg_gain_ok'] else '❌'}")
+        print(f"    📈 Avg MFE: {avg_mfe:.4f}")
+        print(f"    📉 Avg MAE: {avg_mae:.4f} {'✅' if success_criteria['mae_control_ok'] else '❌'}")
+        print(f"    📊 Exposure: {exposure:.2%}")
+        print(f"    ⚠️  CVaR (5%): {cvar_5:.4f}")
+        print(f"    ⚡ Margin Calls: {self.margin_calls}")
+        print(f"    🏆 Success Criteria: {'✅ PASSED' if success_criteria['overall_success'] else '❌ FAILED'}")
+        
+        results['success_criteria'] = success_criteria
         return results
 
-    def _print_backtest_results(self, symbol: str, total_return: float, sharpe_ratio: float, 
-                              max_drawdown: float, win_rate: float, avg_gain_per_trade_pct: float,
-                              avg_mfe: float, avg_mae: float, 
-                              profit_factor_metrics: Dict[str, float]) -> None:
-        """Print formatted backtest results summary."""
-        print(f"  {symbol} leveraged backtest completed:")
-        print(f"    Total Return: {total_return:.2%}")
-        print(f"    Sharpe Ratio: {sharpe_ratio:.4f}")
-        print(f"    Max Drawdown: {max_drawdown:.2%}")
-        print(f"    Total Trades: {self.total_trades}")
-        print(f"    Win Rate: {win_rate:.2%}")
-        print(f"    Avg Gain per Trade: {avg_gain_per_trade_pct:.4f}%")
-        print(f"    Avg MFE: {avg_mfe:.4f}")
-        print(f"    Avg MAE: {avg_mae:.4f}")
-        print(f"    Margin Calls: {self.margin_calls}")
-        
-        # Profit Factor metrics
-        profit_factor = profit_factor_metrics['profit_factor']
-        if profit_factor == float('inf'):
-            print(f"    Profit Factor: ∞ (No losses)")
-        else:
-            print(f"    Profit Factor: {profit_factor:.2f}")
-        
-        print(f"    Gross Profit: ${profit_factor_metrics['gross_profit']:.2f}")
-        print(f"    Gross Loss: ${profit_factor_metrics['gross_loss']:.2f}")
-        print(f"    Largest Win: ${profit_factor_metrics['largest_win']:.2f}")
-        print(f"    Largest Loss: ${profit_factor_metrics['largest_loss']:.2f}")
-        print(f"    Win/Loss Ratio: {profit_factor_metrics['win_loss_ratio']:.2f}")
 
+def clean_previous_results():
+    """Clean up previous backtest result files."""
+    print("🧹 Cleaning up previous backtest results...")
+    
+    # Clean up leveraged_backtest_results directory (main target)
+    results_dir = 'leveraged_backtest_results'
+    csv_count = 0
+    
+    if os.path.exists(results_dir):
+        try:
+            files_in_dir = os.listdir(results_dir)
+            csv_files = [f for f in files_in_dir if f.endswith('.csv')]
+            
+            if csv_files:
+                print(f"   📁 Found {len(csv_files)} CSV files in {results_dir}:")
+                for file in csv_files:
+                    file_path = os.path.join(results_dir, file)
+                    os.remove(file_path)
+                    print(f"   🗑️  Removed: {file}")
+                    csv_count += 1
+            else:
+                print(f"   📁 No CSV files found in {results_dir}")
+                
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not clean {results_dir}: {e}")
+    else:
+        print(f"   📁 Directory {results_dir} does not exist - will be created")
+    
+    # Clean up any backtest_results_*.csv files in the current directory
+    try:
+        current_dir_csvs = [f for f in os.listdir('.') if f.startswith('backtest_results_') and f.endswith('.csv')]
+        for file in current_dir_csvs:
+            os.remove(file)
+            print(f"   🗑️  Removed: {file}")
+            csv_count += 1
+    except Exception as e:
+        print(f"   ⚠️  Warning: Could not clean backtest_results files: {e}")
+    
+    # Clean up backtest_trades directory
+    trades_dir = 'backtest_trades'
+    if os.path.exists(trades_dir):
+        try:
+            trade_csvs = [f for f in os.listdir(trades_dir) if f.endswith('.csv')]
+            for file in trade_csvs:
+                file_path = os.path.join(trades_dir, file)
+                os.remove(file_path)
+                print(f"   🗑️  Removed: {file}")
+                csv_count += 1
+        except Exception as e:
+            print(f"   ⚠️  Warning: Could not clean {trades_dir}: {e}")
+    
+    # Clean up any temporary CSV files
+    try:
+        temp_csvs = [f for f in os.listdir('.') if f.startswith('temp_') and f.endswith('.csv')]
+        for file in temp_csvs:
+            os.remove(file)
+            print(f"   🗑️  Removed temporary file: {file}")
+            csv_count += 1
+    except Exception as e:
+        print(f"   ⚠️  Warning: Could not clean temporary files: {e}")
+    
+    if csv_count > 0:
+        print(f"   ✅ Cleanup completed! Removed {csv_count} CSV files")
+    else:
+        print("   ✅ Cleanup completed! No CSV files found to remove")
+
+def clean_leveraged_results_only():
+    """Clean up only the leveraged_backtest_results directory CSV files."""
+    print("🧹 Cleaning up leveraged_backtest_results CSV files...")
+    
+    results_dir = 'leveraged_backtest_results'
+    csv_count = 0
+    
+    if os.path.exists(results_dir):
+        try:
+            files_in_dir = os.listdir(results_dir)
+            csv_files = [f for f in files_in_dir if f.endswith('.csv')]
+            
+            if csv_files:
+                print(f"   📁 Found {len(csv_files)} CSV files in {results_dir}:")
+                for file in csv_files:
+                    file_path = os.path.join(results_dir, file)
+                    os.remove(file_path)
+                    print(f"   🗑️  Removed: {file}")
+                    csv_count += 1
+                print(f"   ✅ Removed {csv_count} CSV files from {results_dir}")
+            else:
+                print(f"   📁 No CSV files found in {results_dir}")
+                
+        except Exception as e:
+            print(f"   ⚠️  Error cleaning {results_dir}: {e}")
+            return False
+    else:
+        print(f"   📁 Directory {results_dir} does not exist - will be created")
+    
+    return True
 
 def main():
-    """
-    Main function to run leveraged backtesting using existing data files.
-    
-    Executes comprehensive backtesting with the following strategy:
-    - 5x leverage for maximum returns
-    - Balanced allocation: 5.0-10.0% per trade (50-100% exposure)
-    - Drawdown limit: Stop trading if portfolio drawdown > 1.5%
-    - Daily stop-loss: Stop trading if daily loss > 1%
-    - Cross-asset confirmation: At least 1 token must confirm signal
-    - Cointegration filter: Trade only if residual > 1.5σ
-    - Volatility regime filter: Skip trades if ATR > 67.0% or rolling_vol outside 0.0-5.0% range
-    - ATR-based stops: 0.6× ATR(14) stop loss for risk management
-    - Kelly fraction position sizing: Optimizes between 5.0-10.0% positions based on performance
-    - Entry refinement: Signal strength ≥ 40%, Confidence ≥ 30% with enhanced cross-asset analysis
-    - Exit strategy: TREND-FOLLOWING - Hold positions until trend reversal signals
-    """
-    print("Leveraged Trading Signal Backtest System (5x Leverage)")
+    """Main function."""
+    print("⚡ Leveraged Trading Signal Backtest System (5x Leverage)")
     print("=" * 60)
-    print("DATA LOADING FROM EXISTING FILES:")
-    print("  • 5x leverage for maximum returns")
-    print("  • Balanced allocation: 5.0-10.0% per trade (50-100% exposure)")
+    print("🎯 TREND-FOLLOWING HIGH-RETURN STRATEGY WITH LEVERAGE:")
+    print("  • 5x leverage for balanced returns")
+    print("  • Balanced allocation: 10.0-20.0% per trade (50-100% exposure)")
     print("  • Drawdown limit: Stop trading if portfolio drawdown > 1.5% (strict risk control)")
     print("  • Daily stop-loss: Stop trading if daily loss > 1%")
-    print("  • Cross-asset confirmation: At least 1 token must confirm signal")
-    print("  • Cointegration filter: Trade only if residual > 1.5σ")
     print("  • Volatility regime filter: Skip trades if ATR > 67.0% or rolling_vol outside 0.0-5.0% range")
     print("  • Volatility filter: Disabled for maximum trade frequency")
     print("  • ATR-based stops: 0.6× ATR(14) stop loss for risk management")
-    print("  • Kelly fraction position sizing: Optimizes between 5.0-10.0% positions based on performance")
-    print("  • Entry refinement: Signal strength ≥ 40%, Confidence ≥ 30% with enhanced cross-asset analysis")
-    print("  • Exit strategy: TREND-FOLLOWING - Hold positions until trend reversal signals")
-    print("  • Data source: Parquet files for BTC/ETH, CSV files for other symbols")
+    print("  • Kelly fraction position sizing: FIXED - Optimizes between 10.0-20.0% positions (50-100% exposure) based on performance")
+    print("  • Entry refinement: Signal strength ≥ 40%, Confidence ≥ 30%")
+    print("  • Exit strategy: TREND-FOLLOWING - Hold positions until trend reversal signals (no fixed TP)")
+    print("  • Trend reversal detection: Exit long on SELL signals, exit short on BUY signals")
+    print("  • Success criteria: Sharpe ≥ 1.2, Avg gain ≥ 1-2%, Max DD ≤ 1.5%")
     print("=" * 60)
     
-    # Interactive asset selection
-    selected_symbol = select_asset()
+    # Clean up previous results before starting
+    clean_previous_results()
+    print()
     
-    # Interactive backtest period selection
-    backtest_start, backtest_end = get_backtest_period()
-    
-    # Load data from parquet files for BTC and ETH, fallback to CSV for others
-    if selected_symbol in ['BTCUSDT', 'ETHUSDT']:
-        print(f"\nLoading {selected_symbol} data from parquet files...")
-        df = load_data_from_parquet(selected_symbol, 'data')
-        if df.empty:
-            print(f"Failed to load {selected_symbol} from parquet. Please check the data directory.")
-            return
-    else:
-        # Load data from CSV for other symbols
-    csv_file_path = os.path.join('features', f"{selected_symbol}.csv")
-    if not os.path.exists(csv_file_path):
-        print(f"CSV file not found: {csv_file_path}")
-        print("Please ensure the features directory contains the required CSV files.")
-        return
-    
-    try:
-        print(f"Loading complete dataset from {csv_file_path}...")
-        df = pd.read_csv(csv_file_path, low_memory=False)
-        print(f"Successfully loaded {len(df)} rows of {selected_symbol} data from CSV")
-    except Exception as e:
-        print(f"Error loading CSV data: {e}")
-        return
-    
-    # Filter data by selected backtest period
-    df = filter_data_by_period(df, backtest_start, backtest_end)
-    
-    # Initialize backtest engine
     engine = LeveragedBacktestEngine()
     
-    # Load cross-asset data for correlation analysis
-    print("\nLoading cross-asset data for correlation analysis...")
-    cross_asset_symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
+    # Only backtest BTCUSDT and ETHUSDT using parquet files
+    symbols = ['BTCUSDT', 'ETHUSDT']
     
-    for cross_symbol in cross_asset_symbols:
-        if cross_symbol != selected_symbol:
-            # Try parquet files first for BTC and ETH
-            if cross_symbol in ['BTCUSDT', 'ETHUSDT']:
-                try:
-                    print(f"  Loading {cross_symbol} from parquet...")
-                    cross_df = load_data_from_parquet(cross_symbol, 'data')
-                    if not cross_df.empty:
-                        # Store cross-asset data for correlation calculation
-                        engine.cross_asset_data[cross_symbol] = cross_df
-                        engine.cross_asset_returns[cross_symbol] = cross_df['close'].pct_change(1).values
-                except Exception as e:
-                    print(f"  Error loading {cross_symbol} from parquet: {e}")
+    print(f"📊 Backtesting {len(symbols)} specific symbols: {symbols}")
+    
+    all_results = {}
+    summary_results = []
+    successful_assets = 0
+    
+    for symbol in symbols:
+        # Use parquet files from feature directories
+        if symbol == 'BTCUSDT':
+            file_path = 'feature/btcusdt/btcusdt_features.parquet'
+        elif symbol == 'ETHUSDT':
+            file_path = 'feature/ethusdt/ethusdt_features.parquet'
+        else:
+            continue
+        
+        try:
+            df = pd.read_parquet(file_path)
+            print(f"\n📈 Loading {symbol} data from {file_path}: {len(df)} rows")
+            
+            results = engine.backtest_symbol(df, symbol)
+            
+            if 'error' not in results:
+                all_results[symbol] = results
+                
+                if results.get('success_criteria', {}).get('overall_success', False):
+                    successful_assets += 1
+                
+                summary_results.append({
+                    'symbol': symbol,
+                    'total_return': results['total_return'],
+                    'sharpe_ratio': results['sharpe_ratio'],
+                    'sortino_ratio': results['sortino_ratio'],
+                    'max_drawdown': results['max_drawdown'],
+                    'total_trades': results['total_trades'],
+                    'win_rate': results['win_rate'],
+                    'hit_rate': results['hit_rate'],
+                    'exposure': results['exposure'],
+                    'cvar_5': results['cvar_5'],
+                    'avg_gain_per_trade_pct': results['avg_gain_per_trade_pct'],
+                    'avg_mfe': results['avg_mfe'],
+                    'avg_mae': results['avg_mae'],
+                    'margin_calls': results['margin_calls'],
+                    'success_criteria_met': results.get('success_criteria', {}).get('overall_success', False)
+                })
+                
             else:
-                # Fallback to CSV for other symbols
-            cross_csv_path = os.path.join('features', f"{cross_symbol}.csv")
-            if os.path.exists(cross_csv_path):
-                try:
-                    print(f"  Loading {cross_symbol} from CSV...")
-                    cross_df = pd.read_csv(cross_csv_path, low_memory=False)
-                    if not cross_df.empty:
-                        # Store cross-asset data for correlation calculation
-                        engine.cross_asset_data[cross_symbol] = cross_df
-                        engine.cross_asset_returns[cross_symbol] = cross_df['close'].pct_change(1).values
-                except Exception as e:
-                    print(f"  Error loading {cross_symbol}: {e}")
-            else:
-                    print(f"  {cross_symbol} data not found, skipping...")
+                print(f"  ❌ {symbol} backtest failed: {results['error']}")
+                all_results[symbol] = results
+        
+        except Exception as e:
+            print(f"  ❌ Error processing {symbol}: {str(e)}")
+            all_results[symbol] = {'error': str(e)}
     
-    print(f"Loaded cross-asset data for {len(engine.cross_asset_data)} symbols")
+    # Summary
+    if summary_results:
+        os.makedirs('leveraged_backtest_results', exist_ok=True)
+        
+        # Save per-asset summary files with naming like btc_summary.csv, eth_summary.csv
+        for result in summary_results:
+            sym = result.get('symbol', '')
+            sym_lower = str(sym).lower()
+            abbr = sym_lower.replace('usdt', '')  # e.g., btcusdt -> btc
+            summary_path = os.path.join('leveraged_backtest_results', f"{abbr}_summary.csv")
+            pd.DataFrame([result]).to_csv(summary_path, index=False)
+            print(f"📄 Summary saved: {summary_path}")
+        
+        # Collect all trades across symbols
+        all_trades = []
+        for symbol, results in all_results.items():
+            if 'error' not in results and 'trades' in results:
+                for trade in results['trades']:
+                    trade['symbol'] = symbol
+                    all_trades.append(trade)
+        
+        # Save per-asset trades files with naming like btcusdt_trades.csv, ethusdt_trades.csv
+        if all_trades:
+            trades_df_all = pd.DataFrame(all_trades)
+            print(f"   📈 Total trades recorded: {len(all_trades)}")
+            
+            # Print trade summary by symbol and write per-symbol files
+            print(f"\n📊 Trade Summary by Symbol:")
+            for symbol in symbols:
+                sym_lower = str(symbol).lower()
+                symbol_trades_df = trades_df_all[trades_df_all['symbol'] == symbol]
+                if not symbol_trades_df.empty:
+                    buy_trades = (symbol_trades_df['action'] == 'BUY').sum()
+                    sell_trades = (symbol_trades_df['action'] == 'SELL').sum()
+                    print(f"   {symbol}: {int(buy_trades)} entries, {int(sell_trades)} exits")
+                    trades_path = os.path.join('leveraged_backtest_results', f"{sym_lower}_trades.csv")
+                    symbol_trades_df.to_csv(trades_path, index=False)
+                    print(f"📊 Trades saved: {trades_path}")
+        
+        print("\n" + "=" * 60)
+        print("⚡ LEVERAGED BACKTEST SUMMARY (5x Leverage)")
+        print("=" * 60)
+        print(f"🎯 Assets meeting success criteria: {successful_assets}/2 required")
+        print("=" * 60)
+        
+        for result in summary_results:
+            success_icon = "✅" if result['success_criteria_met'] else "❌"
+            print(f"📈 {result['symbol']} {success_icon}:")
+            print(f"  Return: {result['total_return']:.2%}")
+            print(f"  Sharpe: {result['sharpe_ratio']:.4f}")
+            print(f"  Sortino: {result['sortino_ratio']:.4f}")
+            print(f"  Drawdown: {result['max_drawdown']:.2%}")
+            print(f"  Trades: {result['total_trades']}")
+            print(f"  Win Rate: {result['win_rate']:.2%}")
+            print(f"  Hit Rate: {result['hit_rate']:.2%}")
+            print(f"  Exposure: {result['exposure']:.2%}")
+            print(f"  CVaR (5%): {result['cvar_5']:.4f}")
+            print(f"  Avg Gain/Trade: {result['avg_gain_per_trade_pct']:.4f}%")
+            print(f"  Avg MFE: {result['avg_mfe']:.4f}")
+            print(f"  Avg MAE: {result['avg_mae']:.4f}")
+            print(f"  Margin Calls: {result['margin_calls']}")
+            print()
     
-    # Run backtest using loaded data
-    data_source = "parquet" if selected_symbol in ['BTCUSDT', 'ETHUSDT'] else "CSV"
-    print(f"\nStarting leveraged backtest for {selected_symbol} using {data_source} data...")
-    results = engine.backtest_symbol(df, selected_symbol)
-    
-    if 'error' in results:
-        print(f"Backtest failed: {results['error']}")
-        return
-    
-    # Save trades to CSV
-    if results.get('trades'):
-        csv_path = save_trades_to_csv(results['trades'], selected_symbol, results)
-        print(f"\nTrades exported to: {csv_path}")
-    
-    # Print results summary
-    print("\n" + "=" * 60)
-    print("LEVERAGED BACKTEST RESULTS")
-    print("=" * 60)
-    
-    print(f"Symbol: {selected_symbol}")
-    print(f"Total Data Points: {len(df)}")
-    print(f"Total Return: {results['total_return']:.2%}")
-    print(f"Sharpe Ratio: {results['sharpe_ratio']:.4f}")
-    print(f"Max Drawdown: {results['max_drawdown']:.2%}")
-    print(f"Total Trades: {results['total_trades']}")
-    print(f"Win Rate: {results['win_rate']:.2%}")
-    print(f"Avg Gain per Trade: {results['avg_gain_per_trade_pct']:.4f}%")
-    print(f"Avg MFE: {results['avg_mfe']:.4f}")
-    print(f"Avg MAE: {results['avg_mae']:.4f}")
-    print(f"Margin Calls: {results['margin_calls']}")
-    print(f"Leverage: {results['leverage']}x")
-    
-    # Profit Factor metrics
-    profit_factor = results.get('profit_factor', 0)
-    if profit_factor == float('inf'):
-        print(f"Profit Factor: ∞ (No losses)")
-    else:
-        print(f"Profit Factor: {profit_factor:.2f}")
-    
-    print(f"Gross Profit: ${results.get('gross_profit', 0):.2f}")
-    print(f"Gross Loss: ${results.get('gross_loss', 0):.2f}")
-    print(f"Largest Win: ${results.get('largest_win', 0):.2f}")
-    print(f"Largest Loss: ${results.get('largest_loss', 0):.2f}")
-    print(f"Win/Loss Ratio: {results.get('win_loss_ratio', 0):.2f}")
-    
-    print("=" * 60)
-    
-    print(f"\nLeveraged backtest completed!")
-    if results.get('trades'):
-        print(f"Trades saved to: backtest_trades/")
-    print(f"Data source: CSV files with incremental updates")
-    print(f"Timeframe: 5-minute candles")
-    print(f"Features calculated: Technical indicators, cross-asset correlations, target signals")
+    print(f"🎉 Leveraged backtest completed!")
+    print(f"📁 Results saved to: leveraged_backtest_results")
 
-
-def clean_all_csv_files():
-    """
-    Clean all existing CSV files in the features directory.
-    """
-    import os
-    import glob
-    
-    features_dir = 'features'
-    if not os.path.exists(features_dir):
-        print(f"Features directory '{features_dir}' not found.")
-        return
-    
-    # Find all CSV files in features directory
-    csv_files = glob.glob(os.path.join(features_dir, '*.csv'))
-    
-    if not csv_files:
-        print("No CSV files found in features directory.")
-        return
-    
-    print(f"Found {len(csv_files)} CSV files to clean:")
-    for csv_file in csv_files:
-        print(f"  - {os.path.basename(csv_file)}")
-    
-    print("\nCleaning CSV files...")
-    
-    cleaned_count = 0
-    for csv_file in csv_files:
-        symbol = os.path.basename(csv_file).replace('.csv', '')
-        if clean_existing_csv_file(csv_file, symbol):
-            cleaned_count += 1
-    
-    print(f"\nCleaning complete: {cleaned_count}/{len(csv_files)} files cleaned successfully.")
 
 def add_signals_to_csvs():
     """
-    Add signal columns to all CSV files in the features directory.
-    
-    This function processes all CSV files in the 'features_with_residuals' directory
-    and adds two new columns:
-    - target_signal: Trading signal (BUY, SELL, HOLD, WEAK_BUY, WEAK_SELL)
-    - target_position_size: Recommended position size as fraction of capital
-    
-    Returns:
-        None
+    Example function to add signal columns to all CSV files.
+    This demonstrates how to use the new signal column functionality.
     """
-    print("Adding Signal Columns to CSV Files")
+    print("🚀 Adding Signal Columns to CSV Files")
     print("=" * 50)
+    
+    # Clean up previous results before starting
+    clean_previous_results()
+    print()
     
     # Initialize the backtest engine
     engine = LeveragedBacktestEngine()
     
-    # Add signal columns to all CSV files
-    updated_files = engine.add_signal_columns_to_all_csvs('features_with_residuals')
+    # Add signal columns to specific parquet files (BTCUSDT and ETHUSDT only)
+    updated_files = {}
+    
+    for symbol in ['BTCUSDT', 'ETHUSDT']:
+        # Use parquet files from feature directories
+        if symbol == 'BTCUSDT':
+            file_path = 'feature/btcusdt/btcusdt_features.parquet'
+        elif symbol == 'ETHUSDT':
+            file_path = 'feature/ethusdt/ethusdt_features.parquet'
+        else:
+            continue
+        
+        if os.path.exists(file_path):
+            print(f"\n📊 Processing {symbol} from {file_path}...")
+            # Convert parquet to CSV for signal processing, then convert back
+            df = pd.read_parquet(file_path)
+            temp_csv_path = f"temp_{symbol}_features.csv"
+            df.to_csv(temp_csv_path, index=False)
+            
+            updated_path = engine.add_signal_columns_to_csv(temp_csv_path, symbol)
+            updated_files[file_path] = updated_path
+            
+            # Clean up temporary CSV file
+            if os.path.exists(temp_csv_path):
+                os.remove(temp_csv_path)
+        else:
+            print(f"   ❌ File not found: {file_path}")
     
     if updated_files:
-        print(f"\nSummary of Updated Files:")
+        print(f"\n📊 Summary of Updated Files:")
         for original_path, updated_path in updated_files.items():
-            symbol = os.path.basename(original_path).replace('_features_with_residuals.csv', '')
+            symbol = os.path.basename(original_path).replace('_features.parquet', '')
             print(f"   {symbol}: {updated_path}")
         
-        print(f"\nSuccessfully added signal columns to {len(updated_files)} files")
-        print("New files have '_with_signals' suffix")
-        print("New columns added: 'target_signal', 'target_position_size'")
+        print(f"\n✅ Successfully added signal columns to {len(updated_files)} files")
+        print("📁 New files have '_with_signals' suffix")
+        print("📈 New columns added: 'target_signal', 'target_position_size'")
     else:
-        print("No files were processed")
+        print("❌ No files were processed")
 
-
-def run_with_command_line():
-    """
-    Run the backtest with command-line arguments for automation.
-    """
-    parser = argparse.ArgumentParser(description='Leveraged Cryptocurrency Backtest System')
-    parser.add_argument('--asset', type=str, choices=list(AVAILABLE_ASSETS.keys()), 
-                       help='Asset to backtest (BTC, BNB, ETH, SOL, XRP, AVAX, ADA, DOT, LTC, LINK)')
-    parser.add_argument('--start-date', type=str, 
-                       help='Start date in YYYY-MM-DD format')
-    parser.add_argument('--end-date', type=str, 
-                       help='End date in YYYY-MM-DD format')
-    parser.add_argument('--backtest-start', type=str,
-                       help='Backtest start date in YYYY-MM-DD format')
-    parser.add_argument('--backtest-end', type=str,
-                       help='Backtest end date in YYYY-MM-DD format')
-    parser.add_argument('--add-signals', action='store_true',
-                       help='Add signal columns to CSV files instead of running backtest')
-    parser.add_argument('--clean-csv', action='store_true',
-                       help='Clean existing CSV files by removing corrupted data')
-    
-    args = parser.parse_args()
-    
-    if args.add_signals:
-        add_signals_to_csvs()
-        return
-    
-    if args.clean_csv:
-        clean_all_csv_files()
-        return
-    
-    # Use command line arguments if provided, otherwise use interactive mode
-    if args.asset:
-        selected_symbol = AVAILABLE_ASSETS[args.asset]
-        
-        print(f"Running backtest with command-line arguments:")
-        print(f"  Asset: {args.asset} ({selected_symbol})")
-        data_source = "parquet files" if selected_symbol in ['BTCUSDT', 'ETHUSDT'] else "CSV files"
-        print(f"  Mode: Loading from {data_source}")
-        
-        # Load data from parquet files for BTC and ETH, fallback to CSV for others
-        if selected_symbol in ['BTCUSDT', 'ETHUSDT']:
-            print(f"\nLoading {selected_symbol} data from parquet files...")
-            df = load_data_from_parquet(selected_symbol, 'data')
-            if df.empty:
-                print(f"Failed to load {selected_symbol} from parquet. Please check the data directory.")
-                return
-        else:
-            # Load data from CSV for other symbols
-        csv_file_path = os.path.join('features', f"{selected_symbol}.csv")
-        if not os.path.exists(csv_file_path):
-            print(f"CSV file not found: {csv_file_path}")
-            print("Please ensure the features directory contains the required CSV files.")
-            return
-        
-        try:
-            print(f"Loading complete dataset from {csv_file_path}...")
-            df = pd.read_csv(csv_file_path, low_memory=False)
-            print(f"Successfully loaded {len(df)} rows of {selected_symbol} data from CSV")
-        except Exception as e:
-            print(f"Error loading CSV data: {e}")
-            return
-        
-        # Filter data by backtest period if specified
-        backtest_start = args.backtest_start or args.start_date
-        backtest_end = args.backtest_end or args.end_date
-        df = filter_data_by_period(df, backtest_start, backtest_end)
-        
-        # Initialize backtest engine
-        engine = LeveragedBacktestEngine()
-        
-        # Load cross-asset data for correlation analysis
-        print("\nLoading cross-asset data for correlation analysis...")
-        cross_asset_symbols = ['BTCUSDT', 'ETHUSDT', 'BNBUSDT', 'ADAUSDT', 'SOLUSDT']
-        
-        for cross_symbol in cross_asset_symbols:
-            if cross_symbol != selected_symbol:
-                # Try parquet files first for BTC and ETH
-                if cross_symbol in ['BTCUSDT', 'ETHUSDT']:
-                    try:
-                        print(f"  Loading {cross_symbol} from parquet...")
-                        cross_df = load_data_from_parquet(cross_symbol, 'data')
-                        if not cross_df.empty:
-                            # Store cross-asset data for correlation calculation
-                            engine.cross_asset_data[cross_symbol] = cross_df
-                            engine.cross_asset_returns[cross_symbol] = cross_df['close'].pct_change(1).values
-                    except Exception as e:
-                        print(f"  Error loading {cross_symbol} from parquet: {e}")
-                else:
-                    # Fallback to CSV for other symbols
-                cross_csv_path = os.path.join('features', f"{cross_symbol}.csv")
-                if os.path.exists(cross_csv_path):
-                    try:
-                        print(f"  Loading {cross_symbol} from CSV...")
-                        cross_df = pd.read_csv(cross_csv_path, low_memory=False)
-                        if not cross_df.empty:
-                            # Store cross-asset data for correlation calculation
-                            engine.cross_asset_data[cross_symbol] = cross_df
-                            engine.cross_asset_returns[cross_symbol] = cross_df['close'].pct_change(1).values
-                    except Exception as e:
-                        print(f"  Error loading {cross_symbol}: {e}")
-                else:
-                        print(f"  {cross_symbol} data not found, skipping...")
-        
-        print(f"Loaded cross-asset data for {len(engine.cross_asset_data)} symbols")
-        
-        # Run backtest using loaded data
-        data_source = "parquet" if selected_symbol in ['BTCUSDT', 'ETHUSDT'] else "CSV"
-        print(f"\nStarting leveraged backtest for {selected_symbol} using {data_source} data...")
-        results = engine.backtest_symbol(df, selected_symbol)
-        
-        if 'error' in results:
-            print(f"Backtest failed: {results['error']}")
-            return
-        
-        # Save trades to CSV
-        if results.get('trades'):
-            csv_path = save_trades_to_csv(results['trades'], selected_symbol, results)
-            print(f"\nTrades exported to: {csv_path}")
-        
-        # Print results summary
-        print("\n" + "=" * 60)
-        print("LEVERAGED BACKTEST RESULTS")
-        print("=" * 60)
-        
-        print(f"Symbol: {selected_symbol}")
-        print(f"Total Data Points: {len(df)}")
-        print(f"Total Return: {results['total_return']:.2%}")
-        print(f"Sharpe Ratio: {results['sharpe_ratio']:.4f}")
-        print(f"Max Drawdown: {results['max_drawdown']:.2%}")
-        print(f"Total Trades: {results['total_trades']}")
-        print(f"Win Rate: {results['win_rate']:.2%}")
-        print(f"Avg Gain per Trade: {results['avg_gain_per_trade_pct']:.4f}%")
-        print(f"Avg MFE: {results['avg_mfe']:.4f}")
-        print(f"Avg MAE: {results['avg_mae']:.4f}")
-        print(f"Margin Calls: {results['margin_calls']}")
-        print(f"Leverage: {results['leverage']}x")
-        
-        # Profit Factor metrics
-        profit_factor = results.get('profit_factor', 0)
-        if profit_factor == float('inf'):
-            print(f"Profit Factor: ∞ (No losses)")
-        else:
-            print(f"Profit Factor: {profit_factor:.2f}")
-        
-        print(f"Gross Profit: ${results.get('gross_profit', 0):.2f}")
-        print(f"Gross Loss: ${results.get('gross_loss', 0):.2f}")
-        print(f"Largest Win: ${results.get('largest_win', 0):.2f}")
-        print(f"Largest Loss: ${results.get('largest_loss', 0):.2f}")
-        print(f"Win/Loss Ratio: {results.get('win_loss_ratio', 0):.2f}")
-        
-        print("=" * 60)
-        
-        print(f"\nLeveraged backtest completed!")
-        if results.get('trades'):
-            print(f"Trades saved to: backtest_trades/")
-        print(f"Data source: CSV files with incremental updates")
-        print(f"Timeframe: 5-minute candles")
-        print(f"Features calculated: Technical indicators, cross-asset correlations, target signals")
-    else:
-        # Run in interactive mode
-        main()
 
 if __name__ == "__main__":
     import sys
     
-    # Check if user wants to add signal columns
-    if len(sys.argv) > 1 and sys.argv[1] == "--add-signals":
-        add_signals_to_csvs()
+    # Check command line arguments
+    if len(sys.argv) > 1:
+        if sys.argv[1] == "--add-signals":
+            add_signals_to_csvs()
+        elif sys.argv[1] == "--clean":
+            # Clean only leveraged_backtest_results CSV files
+            clean_leveraged_results_only()
+        elif sys.argv[1] == "--clean-all":
+            # Clean all previous results
+            clean_previous_results()
+        else:
+            print("Usage: python backtester.py [--add-signals|--clean|--clean-all]")
+            print("  --add-signals: Add signal columns to CSV files")
+            print("  --clean: Clean only leveraged_backtest_results CSV files")
+            print("  --clean-all: Clean all previous result files")
+            sys.exit(1)
     else:
-        run_with_command_line()
+        main()
